@@ -6,6 +6,7 @@ import dataclasses
 import datetime
 import enum
 import functools
+import importlib
 import logging
 import os
 import pathlib
@@ -13,40 +14,63 @@ import shutil
 import signal
 import sys
 import tarfile
+from importlib.metadata import distribution
 from logging.handlers import RotatingFileHandler
-from typing import TYPE_CHECKING, Final, TypeVar, cast
+from typing import TYPE_CHECKING, Final, TypeVar
 
 import aiofiles
 import aioshutil
-import arc
 import compression.zstd
-import hikari
-import miru
-import orjson
+import interactions
 import pygit2
 from dotenv import load_dotenv
-from hikari.errors import (
-    BadRequestError,
-    BulkDeleteError,
-    ComponentStateConflictError,
-    ForbiddenError,
-    GatewayConnectionError,
-    GatewayServerClosedConnectionError,
-    GatewayTransportError,
-    HikariError,
-    InternalServerError,
-    MissingIntentError,
-    NotFoundError,
-    RateLimitTooLongError,
-    UnauthorizedError,
-    UnrecognisedEntityError,
-    VoiceError,
+from interactions.api.events import (
+    AutocompleteError,
+    CommandError,
+    ComponentError,
+    ModalError,
 )
-from miru.exceptions import NoResponseIssuedError
-from miru.ext import nav
+from interactions.client.errors import (
+    AlreadyDeferred,
+    AlreadyResponded,
+    BadArgument,
+    BadRequest,
+    BotException,
+    CommandCheckFailure,
+    CommandException,
+    CommandOnCooldown,
+    DiscordError,
+    EmptyMessageException,
+    EphemeralEditException,
+    EventLocationNotProvided,
+    ExtensionException,
+    ExtensionLoadException,
+    ExtensionNotFound,
+    Forbidden,
+    ForeignWebhookException,
+    GatewayNotFound,
+    HTTPException,
+    InteractionException,
+    InteractionMissingAccess,
+    LibraryException,
+    LoginError,
+    MaxConcurrencyReached,
+    MessageException,
+    NotFound,
+    RateLimited,
+    ThreadException,
+    ThreadOutsideOfGuild,
+    TooManyChanges,
+    VoiceAlreadyConnected,
+    VoiceConnectionTimeout,
+    VoiceWebSocketClosed,
+    WebSocketClosed,
+    WebSocketRestart,
+)
+from interactions.ext.paginators import Paginator
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 load_dotenv()
 
@@ -63,7 +87,6 @@ TOKEN: Final[str | None] = os.getenv("TOKEN")
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-logger.propagate = False
 log_formatter = logging.Formatter(
     "%(asctime)s | %(process)d - %(processName)s | %(thread)d - %(threadName)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d | %(pathname)s | %(message)s",
     "%Y-%m-%d %H:%M:%S,%f %z",
@@ -75,11 +98,7 @@ log_handler = RotatingFileHandler(
     encoding="utf-8",
 )
 log_handler.setFormatter(log_formatter)
-if not any(
-    isinstance(handler, RotatingFileHandler) and getattr(handler, "baseFilename", None) == str(LOG_FILE)
-    for handler in logger.handlers
-):
-    logger.addHandler(log_handler)
+logger.addHandler(log_handler)
 
 
 T = TypeVar("T")
@@ -92,109 +111,56 @@ if not TOKEN:
     logger.critical("Failed to load TOKEN")
     sys.exit(1)
 
-assert TOKEN is not None
-
-bot = hikari.GatewayBot(
+client = interactions.Client(
     token=TOKEN,
-    banner=None,
-    dumps=orjson.dumps,
-    loads=orjson.loads,
-    logs=None,
-    intents=hikari.Intents.ALL,
+    activity=interactions.Activity(
+        name="with interactions.py",
+        type=interactions.ActivityType.COMPETING,
+        created_at=interactions.Timestamp.now(datetime.timezone.utc),
+    ),
+    debug_scope=GUILD_ID,
+    intents=interactions.Intents.ALL,
+    disable_dm_commands=True,
+    auto_defer=True,
 )
-
-arc_client = arc.client.GatewayClient(
-    bot,
-    default_enabled_guilds=[hikari.snowflakes.Snowflake(GUILD_ID)] if GUILD_ID else hikari.undefined.UNDEFINED,
-)
-
-miru_client = miru.Client.from_arc(arc_client)
 
 os.environ.pop("TOKEN", None)
 with contextlib.suppress(Exception):
     pathlib.Path(".env").unlink(missing_ok=True)
 
 
-@bot.listen()
-async def on_starting(event: hikari.events.StartingEvent) -> None:
-    logger.info("Event app type: %s", type(event.app).__name__)
-    logger.info("Event app: %s", event.app)
+@interactions.listen()
+async def on_login(event: interactions.api.events.internal.Login) -> None:
+    logger.info("Detected app type: %s", type(event.client).__name__)
+    logger.info("Detected app instance: %s", event.client)
 
 
-@bot.listen()
-async def on_started(event: hikari.events.StartedEvent) -> None:
-    logger.info("Event app type: %s", type(event.app).__name__)
-    logger.info("Event app: %s", event.app)
+@interactions.listen()
+async def on_startup(event: interactions.api.events.internal.Startup) -> None:
+    logger.info("Detected app type: %s", type(event.client).__name__)
+    logger.info("Detected app instance: %s", event.client)
     try:
-        me = bot.get_me()
-        status = hikari.Status.ONLINE if me else hikari.Status.DO_NOT_DISTURB
-        activity = hikari.Activity(
-            name="with hikari",
-            type=hikari.ActivityType.LISTENING,
-        )
-        await bot.update_presence(status=status, activity=activity)
-        if me:
-            logger.info("Authenticated as %s (%s)", me.username, me.id)
+        await client.synchronise_interactions(delete_commands=True)
+        if client.user:
+            await client.change_presence(
+                status=interactions.Status.ONLINE if client.user else interactions.Status.DO_NOT_DISTURB,
+            )
+            logger.info(
+                "Authenticated as %s (%s)",
+                client.user.username,
+                client.user.id,
+            )
         else:
-            logger.exception("Failed to retrieve bot user object")
+            logger.exception("Failed to retrieve client user object")
     except Exception:
         logger.exception("Failed to complete startup sequence")
-
-
-@arc_client.add_startup_hook
-async def on_arc_startup(client: arc.GatewayClient) -> None:
-    try:
-        await client.resync_commands()
-    except Exception:
-        logger.exception("Failed to resync commands")
-
-
-@arc_client.listen()
-async def on_arc(event: arc.events.StartedEvent) -> None:
-    logger.info("Event app type: %s", type(event.client).__name__)
-    logger.info("Event app: %s", event.client)
 
 
 # --- Git ---
 
 
-GIT_URL_TRANS_MAP = str.maketrans({"_": "_u_", "/": "_s_", ".": "_d_", "-": "_h_"})
+URL_TRANS_MAP = str.maketrans({"_": "_u_", "/": "_s_", ".": "_d_", "-": "_h_"})
 MAIN_REPO_PATH: Final[str | None] = pygit2.discover_repository(str(BASE_DIR))
-
-
-def resolve_remote_ref(repo: pygit2.Repository) -> pygit2.Reference | None:
-    ref_names = (
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-        "refs/remotes/origin/master",
-    )
-    for ref_name in ref_names:
-        try:
-            ref = repo.lookup_reference(ref_name)
-        except Exception:
-            continue
-        if ref_name.endswith("/HEAD"):
-            target = ref.target
-            if isinstance(target, str):
-                with contextlib.suppress(Exception):
-                    return repo.lookup_reference(target)
-        else:
-            return ref
-    return None
-
-
-def resolve_local_ref(
-    repo: pygit2.Repository,
-    remote_ref: pygit2.Reference,
-) -> pygit2.Reference | None:
-    if not remote_ref.name.startswith("refs/remotes/origin/"):
-        return None
-    local_name = remote_ref.name.replace("refs/remotes/origin/", "refs/heads/", 1)
-    with contextlib.suppress(Exception):
-        return repo.lookup_reference(local_name)
-    with contextlib.suppress(Exception):
-        return repo.create_reference(local_name, remote_ref.target, force=True)
-    return None
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -248,7 +214,7 @@ def parse_repo_url(url: str) -> tuple[str, str, bool]:
         return url, "", False
     return (
         url,
-        f"{relevant_netloc.translate(GIT_URL_TRANS_MAP)}__{path_part.translate(GIT_URL_TRANS_MAP)}",
+        f"{relevant_netloc.translate(URL_TRANS_MAP)}__{path_part.translate(URL_TRANS_MAP)}",
         True,
     )
 
@@ -263,6 +229,7 @@ def clone_repo(url: str) -> tuple[str, bool]:
         pygit2.clone_repository(url, str(repo_path))
         return reponame, True
     except Exception:
+        logger.exception("Failed to clone repository: %s", url)
         shutil.rmtree(repo_path, ignore_errors=True)
         return "", False
 
@@ -272,14 +239,15 @@ def pull_repo(repo_path_str: str) -> int:
         repo = pygit2.Repository(repo_path_str)
         origin = repo.remotes["origin"]
     except Exception:
+        logger.exception("Failed to pull repository: %s", repo_path_str)
         return 2
     with contextlib.suppress(Exception):
         origin.fetch()
-    remote_ref = resolve_remote_ref(repo)
-    if remote_ref is None:
-        return 3
-    local_ref = resolve_local_ref(repo, remote_ref)
-    if local_ref is None:
+    try:
+        remote_ref = repo.lookup_reference("refs/remotes/origin/master")
+        local_ref = repo.lookup_reference("refs/heads/master")
+    except Exception:
+        logger.exception("Failed to lookup reference: %s", repo_path_str)
         return 3
     remote_oid = remote_ref.target
     if local_ref.target == remote_oid:
@@ -289,8 +257,21 @@ def pull_repo(repo_path_str: str) -> int:
         local_ref.set_target(remote_oid)
         repo.head.set_target(remote_oid)
     except Exception:
+        logger.exception("Failed to checkout tree: %s", repo_path_str)
         return 2
     return 0
+
+
+def pull_module(name: str) -> int:
+    if not (repo_path := pygit2.discover_repository(str(EXTENSIONS_DIR / name))):
+        return 2
+    if repo_path == MAIN_REPO_PATH:
+        return 1
+    return pull_repo(repo_path)
+
+
+def pull_kernel() -> int:
+    return pull_repo(MAIN_REPO_PATH) if MAIN_REPO_PATH else 2
 
 
 def is_valid_repo(name: str) -> bool:
@@ -305,57 +286,49 @@ def get_repo_commits(
         repo = pygit2.Repository(repo_path_str)
         origin = repo.remotes["origin"]
     except Exception:
+        logger.exception("Failed to get repo commits for: %s", repo_path_str)
         return None
-
     with contextlib.suppress(Exception):
         origin.fetch()
-
-    remote_ref = resolve_remote_ref(repo)
-    if remote_ref is None:
+    try:
+        remote_ref = repo.lookup_reference("refs/remotes/origin/master")
+    except Exception:
+        logger.exception("Failed to lookup remote reference for: %s", repo_path_str)
         return None
-
     remote_commit_obj = repo.get(remote_ref.target)
     head_commit_obj = repo.get(repo.head.target)
-
     remote_commit: pygit2.Commit | None = remote_commit_obj if isinstance(remote_commit_obj, pygit2.Commit) else None
     head_commit: pygit2.Commit | None = head_commit_obj if isinstance(head_commit_obj, pygit2.Commit) else None
-
     modifications = (
         -1
         if remote_commit is None or head_commit is None
         else repo.diff(head_commit.id, remote_commit.id).stats.files_changed
     )
-
     return head_commit, remote_commit, modifications
 
 
-def get_module_info(name: str) -> tuple[Repo | None, bool]:
+def get_ext_info(name: str) -> tuple[Repo | None, bool]:
     module_path = EXTENSIONS_DIR / name
     repo_path_str = pygit2.discover_repository(str(module_path))
     if not repo_path_str or repo_path_str == MAIN_REPO_PATH:
         return None, False
-
     commits = get_repo_commits(repo_path_str)
     if commits is None:
         return None, False
-
     head_commit, remote_commit, modifications = commits
-
     changelog = ""
     if (changelog_path := module_path / "CHANGELOG").is_file():
         with contextlib.suppress(Exception):
             changelog = changelog_path.read_text(encoding="utf-8", errors="ignore")
-
     try:
         repo = pygit2.Repository(repo_path_str)
         origin = repo.remotes["origin"]
         origin_url: str | None = origin.url
     except Exception:
+        logger.exception("Failed to get origin URL for: %s", repo_path_str)
         return None, False
-
     if origin_url is None:
         return None, False
-
     return Repo(
         mods=modifications,
         url=origin_url,
@@ -368,23 +341,19 @@ def get_module_info(name: str) -> tuple[Repo | None, bool]:
 def get_kernel_info() -> Repo | None:
     if not MAIN_REPO_PATH:
         return None
-
     commits = get_repo_commits(MAIN_REPO_PATH)
     if commits is None:
         return None
-
     head_commit, remote_commit, modifications = commits
-
     try:
         repo = pygit2.Repository(MAIN_REPO_PATH)
         origin = repo.remotes["origin"]
         origin_url: str | None = origin.url
     except Exception:
+        logger.exception("Failed to get kernel repository URL")
         return None
-
     if origin_url is None:
         return None
-
     return Repo(
         mods=modifications,
         url=origin_url,
@@ -396,18 +365,6 @@ def get_kernel_info() -> Repo | None:
 # --- Module ---
 
 
-def pull_kernel() -> int:
-    return pull_repo(MAIN_REPO_PATH) if MAIN_REPO_PATH else 2
-
-
-def pull_module(name: str) -> int:
-    if not (repo_path := pygit2.discover_repository(str(EXTENSIONS_DIR / name))):
-        return 2
-    if repo_path == MAIN_REPO_PATH:
-        return 1
-    return pull_repo(repo_path)
-
-
 def delete_module(name: str) -> bool:
     module_path = EXTENSIONS_DIR / name
     if not module_path.is_dir() or not is_valid_repo(name):
@@ -416,11 +373,12 @@ def delete_module(name: str) -> bool:
         shutil.rmtree(module_path)
         return True
     except Exception:
+        logger.exception("Failed to delete module: %s", module_path)
         return False
 
 
 async def load_module(
-    bot: hikari.GatewayBot,
+    client: interactions.Client,
     module_name: str,
     *,
     is_reload: bool = False,
@@ -429,7 +387,7 @@ async def load_module(
     module_disk_path = EXTENSIONS_DIR / module_name
     if not module_disk_path.is_dir():
         return False
-    is_valid, error_msg, missing_deps = await check_local_module(
+    is_valid, error_msg, missing_deps = await check_local_ext(
         str(module_disk_path),
         module_name,
     )
@@ -439,20 +397,23 @@ async def load_module(
             if missing_deps:
                 msg += f"\n\n**Missing:**\n- {'\n- '.join(missing_deps)}"
             await dm_role_members(
-                embeds=[await reply_embed(bot, "Validation Failed", msg, Color.ERROR)],
+                embeds=[
+                    await mk_embed(client, "Dependencies Failed", msg, Color.ERROR),
+                ],
             )
         return False
     if not is_reload:
         try:
-            arc_client.load_extension(module_full_name)
-            if arc_client.is_started:
-                await arc_client.resync_commands()
+            client.load_extension(module_full_name)
+            if client.is_ready:
+                await client.synchronise_interactions(delete_commands=True)
             return True
         except Exception as e:
+            logger.exception("Failed to load module: %s", module_full_name)
             await dm_role_members(
                 embeds=[
-                    await reply_embed(
-                        bot,
+                    await mk_embed(
+                        client,
                         "Load Failed",
                         f"Failed to load `{module_name}`:\n```py\n{e!s}\n```",
                         Color.ERROR,
@@ -461,102 +422,46 @@ async def load_module(
             )
             await asyncio.to_thread(delete_module, module_name)
             return False
-    backup_submodules = {
-        name: mod
-        for name, mod in sys.modules.items()
-        if name == module_full_name or name.startswith(f"{module_full_name}.")
-    }
     try:
-        with contextlib.suppress(Exception):
-            arc_client.unload_extension(module_full_name)
-
-        for name in list(sys.modules.keys()):
-            if name == module_full_name or name.startswith(f"{module_full_name}."):
-                del sys.modules[name]
-
-        arc_client.load_extension(module_full_name)
-        if arc_client.is_started:
-            await arc_client.resync_commands()
-        logger.info("Reloaded extension '%s'", module_full_name)
+        client.reload_extension(module_full_name)
+        if client.is_ready:
+            await client.synchronise_interactions(delete_commands=True)
+        logger.info("Reloaded module '%s'", module_full_name)
         return True
-
     except Exception as e:
-        logger.exception("Failed to reload extension '%s': %s", module_full_name)
-
-        with contextlib.suppress(Exception):
-            arc_client.unload_extension(module_full_name)
-
-        for name in list(sys.modules.keys()):
-            if name == module_full_name or name.startswith(f"{module_full_name}."):
-                del sys.modules[name]
-
-        for name, mod in backup_submodules.items():
-            sys.modules[name] = mod
-
-        try:
-            arc_client.load_extension(module_full_name)
-            if arc_client.is_started:
-                await arc_client.resync_commands()
-            logger.info(
-                "Rolled back extension '%s' to previous state",
-                module_full_name,
-            )
-            await dm_role_members(
-                embeds=[
-                    await reply_embed(
-                        bot,
-                        "Rollback Succeeded",
-                        f"Failed to reload `{module_name}`:\n```py\n{e!s}\n```\n"
-                        f"The previous version has been restored and is running.",
-                        Color.ERROR,
-                    ),
-                ],
-            )
-        except Exception:
-            logger.exception(
-                "Failed to roll back extension '%s'",
-                module_full_name,
-            )
-            await dm_role_members(
-                embeds=[
-                    await reply_embed(
-                        bot,
-                        "Rollback Failed",
-                        f"Failed to reload `{module_name}`:\n```py\n{e!s}\n```\n"
-                        f"Failed to restore the previous version. "
-                        f"The extension is now in an inconsistent state. "
-                        f"Manual intervention may be required.",
-                        Color.ERROR,
-                    ),
-                ],
-            )
+        logger.exception("Failed to reload module '%s': %s", module_full_name, e)
+        await dm_role_members(
+            embeds=[
+                await mk_embed(
+                    client,
+                    "Reload Failed",
+                    f"Failed to reload `{module_name}`:\n```py\n{e!s}\n```\n"
+                    f"The extension system attempted to restore the previous state.",
+                    Color.ERROR,
+                ),
+            ],
+        )
         return False
 
 
-async def check_local_module(
+async def check_local_ext(
     module_path_str: str,
     module_name: str,
 ) -> tuple[bool, str, list[str]]:
     module_path = pathlib.Path(module_path_str)
     if not module_path.is_dir():
         return False, f"pathlib.Path not found: {module_path}", []
-
-    valid_struct, struct_msg = await check_module_exec(str(module_path), module_name)
+    valid_struct, struct_msg = await check_ext_exec(str(module_path), module_name)
     if not valid_struct:
         return False, struct_msg, []
-
-    valid_deps, missing_deps = await asyncio.to_thread(
-        check_module_deps,
-        str(module_path),
-    )
+    valid_deps, missing_deps = await asyncio.to_thread(check_ext_deps, str(module_path))
     return (True, "", []) if valid_deps else (False, "Missing dependencies.", missing_deps)
 
 
-async def check_remote_module(url: str) -> tuple[bool, str, list[str]]:
+async def check_remote_ext(url: str) -> tuple[bool, str, list[str]]:
     parsed_url, module_name, is_valid_url = parse_repo_url(url)
     if not is_valid_url or not module_name:
         return False, f"Invalid Git URL: {url}", []
-
     async with aiofiles.tempfile.TemporaryDirectory(
         prefix=f"{module_name}_remote_validation_",
     ) as temp_dir:
@@ -564,12 +469,11 @@ async def check_remote_module(url: str) -> tuple[bool, str, list[str]]:
         try:
             await asyncio.to_thread(pygit2.clone_repository, parsed_url, str(temp_path))
         except Exception:
+            logger.exception("Failed to clone repository: %s", parsed_url)
             return False, "Failed to clone", []
-
-        valid_struct, struct_msg = await check_module_exec(str(temp_path), module_name)
+        valid_struct, struct_msg = await check_ext_exec(str(temp_path), module_name)
         if not valid_struct:
             return False, struct_msg, []
-
         error_msg, reqs_preview = "", []
         if (requirements_file := temp_path / "requirements.txt").is_file():
             try:
@@ -584,16 +488,15 @@ async def check_remote_module(url: str) -> tuple[bool, str, list[str]]:
                 for req_str in reqs_preview:
                     Requirement(req_str)
             except Exception as e:
+                logger.exception("Failed to read requirements.txt")
                 error_msg = f"Failed to read requirements.txt: {e}"
-
         return True, error_msg, reqs_preview
 
 
-def check_module_deps(module_path_str: str) -> tuple[bool, list[str]]:
+def check_ext_deps(module_path_str: str) -> tuple[bool, list[str]]:
     requirements_file = pathlib.Path(module_path_str) / "requirements.txt"
     if not requirements_file.is_file():
         return True, []
-
     try:
         content = requirements_file.read_text(encoding="utf-8")
         requirements = [
@@ -601,24 +504,17 @@ def check_module_deps(module_path_str: str) -> tuple[bool, list[str]]:
         ]
     except Exception as e:
         return False, [f"Error reading requirements file: {e}"]
-
     if not requirements:
         return True, []
-
-    from importlib.metadata import PackageNotFoundError, distribution
-
-    from packaging.requirements import Requirement
-    from packaging.version import Version
-
     missing: list[str] = []
     for req_str in requirements:
+        from packaging.version import Version
+
         try:
+            from packaging.requirements import Requirement
+
             req = Requirement(req_str)
-            try:
-                dist = distribution(req.name)
-            except PackageNotFoundError as e:
-                missing.append(f"{req_str} (Missing: {e})")
-                continue
+            dist = distribution(req.name)
             if req.specifier and not req.specifier.contains(
                 Version(dist.version),
                 prereleases=True,
@@ -628,20 +524,17 @@ def check_module_deps(module_path_str: str) -> tuple[bool, list[str]]:
                 )
         except Exception as e:
             missing.append(f"{req_str} (Error: {e})")
-
     return (False, missing) if missing else (True, [])
 
 
-async def check_module_exec(module_path_str: str, module_name: str) -> tuple[bool, str]:
+async def check_ext_exec(module_path_str: str, module_name: str) -> tuple[bool, str]:
     main_file = pathlib.Path(module_path_str) / "main.py"
     if not main_file.is_file():
         return False, f"`main.py` not found in `{module_name}`."
-
     try:
         code = main_file.read_text(encoding="utf-8")
     except Exception as e:
         return False, f"Error reading `main.py`: {e}"
-
     try:
         import ast
 
@@ -653,18 +546,15 @@ async def check_module_exec(module_path_str: str, module_name: str) -> tuple[boo
             False,
             f"Syntax error in `main.py` (line {e.lineno}):\n```py\n{code_snippet}\n```",
         )
-
     try:
         compile(code, str(main_file), "exec", dont_inherit=True)
     except Exception as e:
         return False, f"Compilation error: {e}"
-
     return True, ""
 
 
 # --- pip ---
 
-import importlib
 
 _pip_internal = importlib.import_module("pip._internal.cli.main")
 _pip_module = importlib.import_module("pip")
@@ -680,15 +570,12 @@ def run_pip(file_path: str, install: bool = True) -> bool:
             "Failed to process requirements file: pip main function unavailable",
         )
         return False
-
     path = pathlib.Path(file_path)
     if not path.is_file():
         logger.exception("Failed to locate requirements file: %s", file_path)
         return False
-
     operation = ("install", "-U") if install else ("uninstall", "-y")
     command = [*operation, "-r", file_path]
-
     try:
         status_code = pip_main(command)
         if status_code == 0:
@@ -709,7 +596,7 @@ def run_pip(file_path: str, install: bool = True) -> bool:
         return False
 
 
-# --- UI ---
+# --- View ---
 
 
 class Color(enum.IntEnum):
@@ -718,101 +605,76 @@ class Color(enum.IntEnum):
     INFO = 0x0078D7
 
 
-async def response(
-    ctx: arc.client.GatewayContext | arc.context.base.Context | miru.abc.context.Context,
+async def send_or_edit_response(
+    ctx: interactions.SlashContext | interactions.BaseContext,
     *,
     content: str = "",
-    embeds: hikari.Embed | Sequence[hikari.Embed] | None = None,
-    components: Sequence[hikari.api.ComponentBuilder] | hikari.undefined.UndefinedType = hikari.undefined.UNDEFINED,
+    embeds: interactions.Embed | Sequence[interactions.Embed] | None = None,
+    components: list[interactions.ActionRow] | None = None,
     ephemeral: bool = True,
 ) -> None:
-    undefined = hikari.undefined.UNDEFINED
-    embed_list: Sequence[hikari.Embed] | hikari.undefined.UndefinedType
-    match embeds:
-        case None:
-            embed_list = undefined
-        case hikari.Embed():
-            embed_list = [embeds]
-        case _:
-            embed_list = embeds
-    flags = hikari.MessageFlag.EPHEMERAL if ephemeral else hikari.MessageFlag.NONE
-
-    if ctx.issued_response:
-        try:
-            if hasattr(ctx, "edit_initial_response"):
-                gateway_ctx = cast("arc.client.GatewayContext", ctx)
-                await gateway_ctx.edit_initial_response(
-                    content=content or undefined,
-                    embeds=embed_list or undefined,
-                    components=components,
-                )
-            elif hasattr(ctx, "edit_response"):
-                miru_ctx = cast("miru.abc.context.Context", ctx)
-                await miru_ctx.edit_response(
-                    content=content or undefined,
-                    embeds=embed_list or undefined,
-                    components=components,
-                )
-            elif hasattr(ctx, "respond"):
-                response_obj = await ctx.respond(
-                    content=content or undefined,
-                    embeds=embed_list or undefined,
-                    components=components,
-                )
-                if response_obj:
-                    await response_obj.edit(
-                        content=content or undefined,
-                        embeds=embed_list or undefined,
-                        components=components,
-                    )
-        except Exception:
-            logger.exception("Failed to edit response")
+    embed_list: Sequence[interactions.Embed] | None
+    if embeds is None:
+        embed_list = None
+    elif isinstance(embeds, interactions.Embed):
+        embed_list = [embeds]
     else:
+        embed_list = embeds
+    has_responded = getattr(ctx, "responded", False)
+    has_deferred = getattr(ctx, "deferred", False)
+    if has_responded or has_deferred:
         try:
-            await ctx.respond(
-                content=content,
-                embeds=embed_list,
-                components=components,
-                flags=flags,
-            )
+            edit_method = getattr(ctx, "edit", None)
+            if edit_method:
+                await edit_method(
+                    content=content or "",
+                    embeds=embed_list,
+                    components=components,
+                )
+            return
         except Exception:
-            logger.exception("Failed to send response")
+            pass
+    else:
+        with contextlib.suppress(Exception):
+            respond_method = getattr(ctx, "respond", None)
+            if respond_method:
+                await respond_method(
+                    content=content,
+                    embeds=embed_list,
+                    components=components,
+                    ephemeral=ephemeral,
+                )
 
 
-async def reply_embed(
-    bot: hikari.GatewayBot | hikari.GatewayBotAware,
-    title: str | None,
+async def mk_embed(
+    client: interactions.Client,
+    title: str,
     description: str = "",
     color: Color = Color.INFO,
-) -> hikari.Embed:
-    embed = hikari.Embed(
+) -> interactions.Embed:
+    embed = interactions.Embed(
+        title=title,
         description=description,
         color=int(color),
-        timestamp=datetime.datetime.now(datetime.timezone.utc),
+        timestamp=interactions.Timestamp.now(datetime.timezone.utc),
     )
 
-    if title is not None:
-        embed.title = title
-
-    me = bot.get_me()
-    if me:
-        embed.set_author(name=me.username, icon=me.display_avatar_url)
-        embed.set_footer(text=me.username, icon=me.display_avatar_url)
+    if client.user:
+        embed.set_author(name=client.user.username, icon_url=client.user.avatar_url)
+        embed.set_footer(text=client.user.username, icon_url=client.user.avatar_url)
 
     return embed
 
 
 async def reply_err(
-    bot: hikari.GatewayBot | hikari.GatewayBotAware,
-    ctx: arc.client.GatewayContext | arc.context.base.Context | miru.abc.context.Context | None,
+    client: interactions.Client,
+    ctx: interactions.SlashContext | interactions.BaseContext,
     message: str,
     *,
     ephemeral: bool = True,
 ) -> None:
-    if ctx is None:
-        return
-    embed = await reply_embed(bot, "Exception", message[:1900], Color.ERROR)
-    await response(
+    embed = await mk_embed(client, "Exception", message[:1900], Color.ERROR)
+    await send_or_edit_response(
         ctx,
         embeds=embed,
         ephemeral=ephemeral,
@@ -820,37 +682,33 @@ async def reply_err(
 
 
 async def reply_ok(
-    bot: hikari.GatewayBot | hikari.GatewayBotAware,
-    ctx: arc.client.GatewayContext | arc.context.base.Context | miru.abc.context.Context | None,
+    client: interactions.Client,
+    ctx: interactions.SlashContext | interactions.BaseContext,
     message: str,
     *,
-    title: str | None = "Completion",
     ephemeral: bool = True,
 ) -> None:
-    if ctx is None:
-        return
-    embed = await reply_embed(bot, title, message)
-    await response(
+    embed = await mk_embed(client, "Complete", message)
+    await send_or_edit_response(
         ctx,
         embeds=embed,
         ephemeral=ephemeral,
     )
 
 
-async def defer(
-    ctx: arc.client.GatewayContext | arc.context.base.Context | miru.abc.context.Context | None,
-) -> None:
-    if ctx is None:
-        return
-    if ctx.issued_response:
+async def defer_safe(ctx: interactions.SlashContext) -> None:
+    has_responded = getattr(ctx, "responded", False)
+    has_deferred = getattr(ctx, "deferred", False)
+    if has_responded or has_deferred:
         return
     try:
-        await ctx.defer(flags=hikari.MessageFlag.EPHEMERAL)
+        await ctx.defer(ephemeral=True)
     except Exception:
+        logger.exception("Failed to defer")
         with contextlib.suppress(Exception):
             await ctx.respond(
                 "Failed to defer.",
-                flags=hikari.MessageFlag.EPHEMERAL,
+                ephemeral=True,
             )
 
 
@@ -858,669 +716,394 @@ async def defer(
 
 
 async def dm_role_members(
-    ctx: arc.client.GatewayContext | None = None,
+    ctx: interactions.SlashContext | None = None,
     msg: str | None = None,
     *,
-    embeds: Sequence[hikari.Embed] | None = None,
-    components: Sequence[hikari.api.ComponentBuilder] | hikari.undefined.UndefinedType = hikari.undefined.UNDEFINED,
-) -> list[hikari.Message]:
+    embeds: Sequence[interactions.Embed] | None = None,
+    components: list[interactions.ActionRow] | None = None,
+) -> list[interactions.Message]:
     if not (ROLE_ID and GUILD_ID):
         return []
 
-    me = bot.get_me()
-
-    guild_id = ctx.guild_id if ctx and ctx.guild_id else hikari.snowflakes.Snowflake(GUILD_ID)
-
-    members_view = bot.cache.get_members_view_for_guild(guild_id)
-    if members_view:
-        members_set = {m for m in members_view.values() if any(r.id == ROLE_ID for r in m.get_roles())}
-    else:
-        members_set = {m async for m in bot.rest.fetch_members(guild_id) if any(r.id == ROLE_ID for r in m.get_roles())}
-
-    if not members_set:
+    bot_user = client.user
+    if not bot_user:
         return []
 
-    processed_embeds = list(embeds) if embeds else hikari.undefined.UNDEFINED
-    semaphore = asyncio.Semaphore(10)
+    try:
+        guild: interactions.Guild | None
+        if ctx and hasattr(ctx, "guild") and ctx.guild:
+            guild = ctx.guild if isinstance(ctx.guild, interactions.Guild) else await client.fetch_guild(GUILD_ID)
+        else:
+            guild = await client.fetch_guild(GUILD_ID)
 
-    async def dm_member(
-        member: hikari.Member | hikari.User,
-    ) -> hikari.Message | None:
-        if me and member.id == me.id:
-            return None
-        async with semaphore:
-            with contextlib.suppress(Exception):
+        if not guild:
+            logger.exception(f"Failed to fetch guild {GUILD_ID}")
+            return []
+
+        role = await guild.fetch_role(int(ROLE_ID))
+        if not role:
+            logger.exception(f"Failed to fetch role {ROLE_ID} in guild {GUILD_ID}")
+            return []
+
+        members = [m for m in role.members if m.id != bot_user.id]
+        if not members:
+            return []
+
+        processed_embeds = list(embeds) if embeds else None
+
+        async def send_dm(member: interactions.Member) -> interactions.Message | None:
+            try:
                 return await member.send(
                     content=msg,
                     embeds=processed_embeds,
                     components=components,
                 )
-        return None
+            except Exception:
+                logger.debug(f"Failed to send DM to member {member.id}")
+                return None
 
-    return [r for r in await asyncio.gather(*(dm_member(m) for m in members_set)) if r]
+        tasks = [send_dm(member) for member in members]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
 
+        return [msg for msg in results if msg is not None]
 
-# --- Hook ---
-
-
-async def is_privileged(ctx: arc.client.GatewayContext) -> arc.HookResult:
-    if ROLE_ID and ctx.member:
-        has_role = any(r.id == ROLE_ID for r in ctx.member.get_roles())
-        if not has_role:
-            logger.info(
-                "Denied access to user %s: missing required role %s",
-                ctx.user.id,
-                ROLE_ID,
-            )
-            await reply_err(
-                bot,
-                ctx,
-                "Access denied: insufficient privileges.",
-                ephemeral=True,
-            )
-            return arc.HookResult(abort=True)
-        return arc.HookResult(abort=False)
-
-    logger.warning(
-        "Failed to verify permissions for user %s: ROLE_ID not set or ctx.member is None",
-        ctx.user.id,
-    )
-    await reply_err(
-        bot,
-        ctx,
-        "Access denied: permission verification failed.",
-        ephemeral=True,
-    )
-    return arc.HookResult(abort=True)
+    except Exception:
+        logger.exception(
+            f"Failed to process role members for guild {GUILD_ID}, role {ROLE_ID}",
+        )
+        return []
 
 
 # --- Commands ---
 
 
-cmd_group = arc_client.include_slash_group("kernel", "Bot Framework Kernel Commands")
-cmd_module = cmd_group.include_subgroup("module", "Module Commands")
-cmd_review = cmd_group.include_subgroup("review", "Review Commands")
-cmd_debug = cmd_group.include_subgroup("debug", "Debug commands")
+async def is_privileged(ctx: interactions.SlashContext) -> bool:
+    if ROLE_ID and isinstance(ctx.author, interactions.Member):
+        has_role = ctx.author.has_role(interactions.Snowflake(ROLE_ID))
+        if not has_role:
+            logger.info(
+                "Denied access to user %s: missing required role %s",
+                ctx.author.id,
+                ROLE_ID,
+            )
+            await reply_err(
+                client,
+                ctx,
+                "Insufficient privileges.",
+                ephemeral=True,
+            )
+            return False
+        return True
+    logger.warning(
+        "Failed to verify permissions for user %s: ROLE_ID not set or ctx.author is not Member",
+        ctx.author.id,
+    )
+    await reply_err(
+        client,
+        ctx,
+        "Invalid configuration.",
+        ephemeral=True,
+    )
+    return False
 
-cmd_group.add_hook(is_privileged)
-cmd_group.add_hook(arc.guild_only)
-cmd_group.add_hook(arc.utils.hooks.limiters.guild_limiter(60.0, 2))
-cmd_group.set_concurrency_limiter(arc.guild_concurrency(1))
+
+cmd_group = interactions.SlashCommand(
+    name="framework",
+    description="client Framework Commands",
+    checks=[is_privileged],
+    dm_permission=False,
+    default_member_permissions=interactions.Permissions.ADMINISTRATOR,
+    cooldown=interactions.models.internal.cooldowns.Cooldown(
+        cooldown_bucket=interactions.models.internal.cooldowns.Buckets.GUILD,
+        rate=2,
+        interval=60,
+    ),
+    max_concurrency=interactions.models.internal.cooldowns.MaxConcurrency(
+        concurrent=1,
+        concurrency_bucket=interactions.models.internal.cooldowns.Buckets.GUILD,
+    ),
+)
+cmd_module = cmd_group.group(name="module", description="Module Commands")
+cmd_kernel = cmd_group.group(name="review", description="Kernel Commands")
+cmd_debug = cmd_group.group(name="debug", description="Debug Commands")
 
 
-@arc_client.set_error_handler
-async def error_handler(ctx: arc.client.GatewayContext, error: Exception) -> None:
-    if isinstance(error, arc.errors.GuildOnlyError):
+@interactions.listen(CommandError, disable_default_listeners=True)
+@interactions.listen(ComponentError, disable_default_listeners=True)
+@interactions.listen(AutocompleteError, disable_default_listeners=True)
+@interactions.listen(ModalError, disable_default_listeners=True)
+async def on_error(event: CommandError) -> None:
+    error = event.error
+    ctx = event.ctx
+
+    if isinstance(error, CommandCheckFailure):
         logger.warning(
-            "Failed to invoke command '%s' outside guild for user %s",
-            ctx.command.name,
+            "Rejected command from user %s: %s (check: %s)",
             ctx.user.id,
+            error,
+            error.check.__name__ if hasattr(error.check, "__name__") else str(error.check),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Command restricted to guild channels.",
+            "Failed to meet command requirements.",
             ephemeral=True,
         )
-    elif isinstance(error, arc.errors.DMOnlyError):
-        logger.warning(
-            "Failed to invoke command '%s' outside DM for user %s",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Command restricted to DM channels.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.NotOwnerError):
-        logger.warning(
-            "Failed to invoke owner-only command '%s' for user %s",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Command restricted to bot owners.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.InvokerMissingPermissionsError):
-        missing_perms = error.missing_permissions
-        logger.warning(
-            "Failed to invoke command '%s' for user %s: missing permissions %s",
-            ctx.command.name,
-            ctx.user.id,
-            missing_perms,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            f"Missing required permissions: {missing_perms}",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.BotMissingPermissionsError):
-        missing_perms = error.missing_permissions
-        logger.error(
-            "Failed to execute command '%s' in guild %s: bot missing permissions %s",
-            ctx.command.name,
-            ctx.guild_id or "unknown",
-            missing_perms,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            f"Bot missing required permissions: {missing_perms}",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.UnderCooldownError):
-        retry_after = error.retry_after
+    elif isinstance(error, CommandOnCooldown):
+        retry_after = error.cooldown.get_cooldown_time()
         logger.info(
-            "Rate limiting command '%s' for user %s: retry in %.2fs",
-            ctx.command.name,
+            "Rate limited command for user %s: retrying in %.2fs",
             ctx.user.id,
             retry_after,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Rate limited. Retry in {retry_after:.1f}s.",
+            f"Failed to execute rate-limited command. Retry in {retry_after:.1f}s.",
             ephemeral=True,
         )
-    elif isinstance(error, arc.errors.MaxConcurrencyReachedError):
-        max_concurrency = error.max_concurrency
+    elif isinstance(error, RateLimited):
+        retry_after = getattr(error, "retry_after", 5.0)
         logger.info(
-            "Blocking concurrent invocation of command '%s' for user %s: maximum %d instances running",
-            ctx.command.name,
-            ctx.user.id,
-            max_concurrency,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            f"Reached maximum concurrent instances ({max_concurrency}).",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.utils.ratelimiter.RateLimiterExhaustedError):
-        retry_after = error.retry_after
-        logger.info(
-            "Exhausted rate limit for command '%s' by user %s: retry in %.2fs",
-            ctx.command.name,
+            "Exhausted rate limit for user %s: retrying in %.2fs (status: %s, route: %s)",
             ctx.user.id,
             retry_after,
+            getattr(error, "status", "unknown"),
+            getattr(error, "route", "unknown"),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Rate limit exhausted. Retry in {retry_after:.1f}s.",
+            f"Failed to execute command due to rate limit. Retry in {retry_after:.1f}s.",
             ephemeral=True,
         )
-    elif isinstance(error, arc.errors.NoResponseIssuedError):
-        logger.error(
-            "Failed to issue response for command '%s' by user %s: interaction timeout",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Interaction timed out.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.ResponseAlreadyIssuedError):
-        logger.error(
-            "Failed to issue duplicate response for command '%s' by user %s",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Attempted duplicate response.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.CommandInvokeError):
-        logger.error(
-            "Failed to invoke command '%s' for user %s: %s",
-            ctx.command.name,
-            ctx.user.id,
-            str(error.__cause__ or error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Command failed during invocation.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.AutocompleteError):
-        logger.warning(
-            "Failed to complete autocomplete for command '%s' by user %s: %s",
-            ctx.command.name,
-            ctx.user.id,
-            str(error.__cause__ or error),
-        )
-    elif isinstance(error, arc.errors.OptionConverterFailureError):
-        failed_option = error.option
-        failed_value = error.value
-        logger.warning(
-            "Failed to convert option for command '%s' by user %s: option '%s' with value '%s'",
-            ctx.command.name,
-            ctx.user.id,
-            getattr(failed_option, "name", "unknown"),
-            failed_value,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            f"Option '{getattr(failed_option, 'name', 'unknown')}' rejected value '{failed_value}'.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.ExtensionLoadError):
-        logger.error(
-            "Failed to load extension: %s",
-            str(error.__cause__ or error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Extension failed to load.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.ExtensionUnloadError):
-        logger.error(
-            "Failed to unload extension: %s",
-            str(error.__cause__ or error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Extension failed to unload.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.CommandPublishFailedError):
-        logger.error(
-            "Failed to publish commands: %s",
-            str(error.__cause__ or error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Command publishing failed.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.GlobalCommandPublishFailedError):
-        logger.error(
-            "Failed to publish global commands: %s",
-            str(error.__cause__ or error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Global command publishing failed.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.GuildCommandPublishFailedError):
-        guild_id = error.guild_id
-        logger.error(
-            "Failed to publish guild commands for guild %s: %s",
-            guild_id,
-            str(error.__cause__ or error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            f"Guild command publishing failed for guild {guild_id}.",
-            ephemeral=True,
-        )
-    elif isinstance(error, arc.errors.HookAbortError):
+    elif isinstance(error, MaxConcurrencyReached):
         logger.info(
-            "Aborted command '%s' for user %s by hook: %s",
-            ctx.command.name,
+            "Blocked concurrent command execution by user %s (max: %s)",
             ctx.user.id,
-            str(error.__cause__ or error),
+            getattr(error, "max_conc", "unknown"),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Command aborted by hook.",
+            "Failed to execute command due to concurrency limit.",
             ephemeral=True,
         )
-    elif isinstance(error, arc.errors.ArcError):
-        logger.error(
-            "Failed to execute command '%s' for user %s: %s",
-            ctx.command.name,
+    elif isinstance(error, BadArgument):
+        logger.info(
+            "Rejected invalid argument for command by user %s: %s",
             ctx.user.id,
-            str(error.__cause__ or error),
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Internal framework error.",
+            f"Failed to validate argument: {error}",
             ephemeral=True,
         )
-    elif isinstance(error, BadRequestError):
+    elif isinstance(error, CommandException):
         logger.error(
-            "Failed to send request for command '%s' by user %s: %s",
-            ctx.command.name,
+            "Encountered command exception in command by user %s: %s",
             ctx.user.id,
-            str(error),
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Sent invalid request to Discord.",
+            "Failed to execute command due to command error.",
             ephemeral=True,
         )
-    elif isinstance(error, UnauthorizedError):
-        logger.error(
-            "Failed to authorize for command '%s' by user %s: %s",
-            ctx.command.name,
+    elif isinstance(error, (Forbidden, InteractionMissingAccess)):
+        logger.warning(
+            "Denied access to command for user %s: %s (scope: %s)",
             ctx.user.id,
-            str(error),
+            error,
+            getattr(error, "scope", "unknown"),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Bot authorization failed.",
+            "Insufficient permissions.",
             ephemeral=True,
         )
-    elif isinstance(error, ForbiddenError):
+    elif isinstance(error, (HTTPException, BadRequest, NotFound)):
         logger.error(
-            "Failed to access forbidden resource for command '%s' by user %s: %s",
-            ctx.command.name,
+            "Encountered HTTP error in command by user %s: %s (status: %s, code: %s, route: %s)",
             ctx.user.id,
-            str(error),
+            error,
+            getattr(error, "status", "unknown"),
+            getattr(error, "code", "unknown"),
+            getattr(error, "route", "unknown"),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Bot lacks required permissions.",
+            "Failed to execute command due to API error.",
             ephemeral=True,
         )
-    elif isinstance(error, NotFoundError):
-        logger.error(
-            "Failed to locate resource for command '%s' by user %s: %s",
-            ctx.command.name,
+    elif isinstance(error, (AlreadyResponded, AlreadyDeferred, EphemeralEditException)):
+        logger.warning(
+            "Detected interaction state conflict in command by user %s: %s",
             ctx.user.id,
-            str(error),
+            error,
+        )
+    elif isinstance(
+        error,
+        (ExtensionException, ExtensionLoadException, ExtensionNotFound),
+    ):
+        logger.error(
+            "Encountered extension error in command by user %s: %s",
+            ctx.user.id,
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Requested resource not found.",
+            "Failed to execute command due to extension error.",
             ephemeral=True,
         )
-    elif isinstance(error, RateLimitTooLongError):
-        retry_after = getattr(error, "retry_after", 0)
-        route = getattr(error, "route", "unknown")
+    elif isinstance(error, (MessageException, EmptyMessageException)):
         logger.error(
-            "Failed to execute command '%s' for user %s: rate limit exceeded, retry after %.1fs (route %s)",
-            ctx.command.name,
+            "Failed to send message for command by user %s: %s",
             ctx.user.id,
-            retry_after,
-            route,
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Rate limit exceeded. Retry after {retry_after:.1f}s.",
+            "Failed to send message.",
             ephemeral=True,
         )
-    elif isinstance(error, InternalServerError):
+    elif isinstance(
+        error,
+        (VoiceAlreadyConnected, VoiceConnectionTimeout, VoiceWebSocketClosed),
+    ):
         logger.error(
-            "Failed to execute command '%s' for user %s: Discord internal server error",
-            ctx.command.name,
+            "Encountered voice connection error in command by user %s: %s (code: %s)",
             ctx.user.id,
+            error,
+            getattr(error, "code", "unknown"),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Discord internal server error.",
+            "Failed to establish voice connection.",
             ephemeral=True,
         )
-
-    elif isinstance(error, GatewayConnectionError):
+    elif isinstance(error, (WebSocketClosed, WebSocketRestart, GatewayNotFound)):
         logger.error(
-            "Failed to connect gateway for command '%s' by user %s: %s",
-            ctx.command.name,
+            "Detected connection failure in command by user %s: %s (code: %s, resume: %s)",
             ctx.user.id,
-            str(error),
+            error,
+            getattr(error, "code", "unknown"),
+            getattr(error, "resume", "unknown"),
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Gateway connection failed.",
+            "Failed to execute command due to connection error.",
             ephemeral=True,
         )
-    elif isinstance(error, GatewayTransportError):
+    elif isinstance(error, (ThreadException, ThreadOutsideOfGuild)):
         logger.error(
-            "Failed to transport gateway for command '%s' by user %s: %s",
-            ctx.command.name,
+            "Failed to perform thread operation in command by user %s: %s",
             ctx.user.id,
-            str(error),
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Gateway transport failed.",
+            "Failed to execute thread operation.",
             ephemeral=True,
         )
-    elif isinstance(error, GatewayServerClosedConnectionError):
-        code = getattr(error, "code", "unknown")
-        can_reconnect = getattr(error, "can_reconnect", False)
+    elif isinstance(error, DiscordError):
         logger.error(
-            "Failed to maintain gateway connection for command '%s' by user %s: server closed connection (code %s, can_reconnect %s)",
-            ctx.command.name,
+            "Encountered Discord error in command by user %s: %s",
             ctx.user.id,
-            code,
-            can_reconnect,
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Gateway connection closed by server.",
+            "Failed to execute command due to Discord error.",
             ephemeral=True,
         )
-
-    elif isinstance(error, ComponentStateConflictError):
+    elif isinstance(error, (BotException, LibraryException, InteractionException)):
         logger.error(
-            "Failed to resolve component state for command '%s' by user %s: %s",
-            ctx.command.name,
+            "Encountered bot error in command by user %s: %s",
             ctx.user.id,
-            str(error),
+            error,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Component state conflict.",
+            "Failed to execute command due to bot error.",
             ephemeral=True,
         )
-    elif isinstance(error, UnrecognisedEntityError):
-        logger.error(
-            "Failed to recognise entity for command '%s' by user %s: %s",
-            ctx.command.name,
-            ctx.user.id,
-            str(error),
-        )
+    elif isinstance(
+        error,
+        (TooManyChanges, ForeignWebhookException, EventLocationNotProvided, LoginError),
+    ):
+        logger.error("Failed to execute command by user %s: %s", ctx.user.id, error)
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Unrecognised entity encountered.",
-            ephemeral=True,
-        )
-    elif isinstance(error, BulkDeleteError):
-        deleted_count = len(getattr(error, "deleted_messages", []))
-        logger.error(
-            "Failed to bulk delete for command '%s' by user %s: partially completed (%d messages deleted)",
-            ctx.command.name,
-            ctx.user.id,
-            deleted_count,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            f"Bulk delete partially completed ({deleted_count} messages deleted).",
-            ephemeral=True,
-        )
-    elif isinstance(error, VoiceError):
-        logger.error(
-            "Failed to process voice for command '%s' by user %s: %s",
-            ctx.command.name,
-            ctx.user.id,
-            str(error),
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Voice subsystem error.",
-            ephemeral=True,
-        )
-    elif isinstance(error, MissingIntentError):
-        missing_intents = getattr(error, "intents", "unknown")
-        logger.error(
-            "Failed to execute command '%s' for user %s: missing intents %s",
-            ctx.command.name,
-            ctx.user.id,
-            missing_intents,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Missing required bot intents.",
-            ephemeral=True,
-        )
-
-    elif isinstance(error, HikariError):
-        logger.error(
-            "Failed to execute command '%s' for user %s: library error",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Internal library error.",
-            ephemeral=True,
-        )
-    elif isinstance(error, NoResponseIssuedError):
-        logger.error(
-            "Failed to issue response for command '%s' by user %s: interaction timeout",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "Interaction timed out.",
-            ephemeral=True,
-        )
-    elif isinstance(error, miru.RowFullError):
-        logger.error(
-            "Failed to add UI component for command '%s' by user %s: row is full",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "UI row is full.",
-            ephemeral=True,
-        )
-    elif isinstance(error, miru.HandlerFullError):
-        logger.error(
-            "Failed to add UI handler for command '%s' by user %s: handler is full",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "UI handler is full.",
-            ephemeral=True,
-        )
-    elif isinstance(error, miru.ItemAlreadyAttachedError):
-        logger.error(
-            "Failed to attach UI component for command '%s' by user %s: component already attached",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "UI component already attached.",
-            ephemeral=True,
-        )
-    elif isinstance(error, miru.MiruError):
-        logger.error(
-            "Failed to process UI for command '%s' by user %s: framework error",
-            ctx.command.name,
-            ctx.user.id,
-        )
-        await reply_err(
-            bot,
-            ctx,
-            "UI framework error.",
+            "Failed to execute command.",
             ephemeral=True,
         )
     else:
         raise error
 
 
-# --- Command Export ---
+# --- Command Debug Export ---
 
 
-async def export_path_autocomplete(
-    ctx: arc.context.autocomplete.AutocompleteData[arc.client.GatewayClient, str],
-) -> Sequence[str]:
-    choices: list[str] = ["all"]
-
-    try:
-        with os.scandir(BASE_DIR) as entries:
-            files = [entry.name for entry in entries if entry.is_file() and not entry.name.startswith(".")]
-        choices.extend(sorted(files))
-    except Exception:
-        logger.exception("Failed to autocomplete")
-        choices = ["error"]
-
-    return choices[:25]
-
-
-@cmd_debug.include()
-@arc.slash_subcommand(name="export", description="Export files/directories")
-async def cmd_export(
-    ctx: arc.client.GatewayContext,
-    path: arc.Option[
-        str,
-        arc.StrParams(
-            name="path",
-            description="Relative path to export",
-            autocomplete_with=export_path_autocomplete,
-        ),
-    ],
-) -> None:
-    await defer(ctx)
+@cmd_debug.subcommand(
+    "export",
+    sub_cmd_description="Export files/directories",
+)
+@interactions.slash_option(
+    name="path",
+    description="Relative path to export",
+    required=True,
+    opt_type=interactions.OptionType.STRING,
+    autocomplete=True,
+)
+async def cmd_export(ctx: interactions.SlashContext, path: str) -> None:
+    await defer_safe(ctx)
 
     try:
         target_path = BASE_DIR.joinpath(path).resolve()
     except Exception:
         logger.exception("Failed to resolve export path")
-        await reply_err(bot, ctx, "Invalid path format.")
+        await reply_err(
+            client,
+            ctx,
+            "Failed to resolve path: invalid format.",
+        )
         return
 
     if BASE_DIR not in target_path.parents and target_path != BASE_DIR:
-        await reply_err(bot, ctx, "Path outside allowed directory.")
+        await reply_err(
+            client,
+            ctx,
+            "Failed to access path: outside allowed directory.",
+        )
         return
 
     if not target_path.exists():
-        await reply_err(bot, ctx, f"Path `{path}` does not exist.")
+        await reply_err(
+            client,
+            ctx,
+            f"Failed to locate path: `{path}` does not exist.",
+        )
         return
 
     if not (target_path.is_file() or target_path.is_dir()):
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Path `{path}` is neither file nor directory.",
+            f"Failed to identify path type: `{path}` is neither file nor directory.",
         )
         return
 
@@ -1535,105 +1118,127 @@ async def cmd_export(
                 root_dir=str(target_path.parent),
                 base_dir=target_path.name,
             )
+
             zst_filename = str(tar_filename) + ".zst"
             with open(tar_filename, "rb") as f_in, open(zst_filename, "wb") as f_out:
                 f_out.write(compression.zstd.compress(f_in.read(), level=6))
+
             pathlib.Path(tar_filename).unlink()
             archive_filename = zst_filename
-        except Exception:
-            logger.exception("Failed to create archive")
-            await reply_err(bot, ctx, "Failed to create archive.")
+        except Exception as e:
+            await reply_err(client, ctx, f"Failed to create archive: {e}")
             return
 
         if not archive_filename or not pathlib.Path(archive_filename).exists():
-            await reply_err(bot, ctx, "Failed to create archive: output file missing.")
+            await reply_err(client, ctx, "Failed to create output file.")
             return
 
         await ctx.respond(
-            f"Exported `{path}`:",
-            attachments=[hikari.File(archive_filename)],
+            f"Exporting `{path}`:",
+            attachments=[interactions.File(archive_filename)],
         )
 
 
-# --- Restart Command ---
+@cmd_export.autocomplete("path")
+async def cmd_export_path(
+    ctx: interactions.AutocompleteContext,
+) -> None:
+    choices: list[interactions.SlashCommandChoice] = [
+        interactions.SlashCommandChoice(name="All Files", value="all"),
+    ]
+    try:
+        files = [f for f in os.listdir(BASE_DIR) if (BASE_DIR / f).is_file() and not f.startswith(".")]
+        choices.extend(
+            [interactions.SlashCommandChoice(name=file, value=file) for file in sorted(files)],
+        )
+    except Exception as e:
+        logger.exception("Failed to autocomplete")
+        choices = [interactions.SlashCommandChoice(name=f"Error: {e!s}", value="error")]
+
+    await ctx.send(choices[:25])
 
 
-@cmd_debug.include()
-@arc.slash_subcommand(name="restart", description="Restart the bot")
-async def cmd_reboot(ctx: arc.client.GatewayContext) -> None:
-    await defer(ctx)
-    executor = ctx.user
+# --- Command Debug Restart ---
+
+
+@cmd_debug.subcommand("restart", sub_cmd_description="Restart the client")
+async def cmd_reboot(ctx: interactions.SlashContext) -> None:
+    await defer_safe(ctx)
+    executor = ctx.author
 
     try:
-        embed = await reply_embed(
-            bot,
+        embed = await mk_embed(
+            client,
             "Restart Initiated",
-            f"{executor.mention} initiated bot restart.",
+            f"{executor.mention} initiated client restart.",
             Color.WARN,
         )
         if ctx.member:
             embed.set_author(
                 name=ctx.member.display_name,
-                icon=ctx.member.display_avatar_url,
+                icon_url=ctx.member.avatar_url,
             )
 
         await dm_role_members(ctx, embeds=[embed])
-        await reply_ok(bot, ctx, "Initiated bot restart sequence.")
+        await reply_ok(client, ctx, "Initiating client restart sequence.")
 
         FLAG_DIR.mkdir(exist_ok=True)
         (FLAG_DIR / "restart").write_text(
             f"Restart at {datetime.datetime.now(datetime.timezone.utc).isoformat()} by {executor.id}",
         )
-        await bot.close()
+        await client.stop()
     except Exception as e:
-        logger.exception("Failed to execute restart command: %s", e)
-        await reply_err(bot, ctx, f"Failed to restart bot: {e}")
+        logger.exception("Failed to execute restart command: %s")
+        await reply_err(client, ctx, f"Failed to restart client: {e}")
 
 
-# --- Load Module Command ---
+# --- Command Module Load ---
 
 
-@cmd_module.include()
-@arc.slash_subcommand(name="load", description="Load module from Git URL")
-async def cmd_load_mod(
-    ctx: arc.client.GatewayContext,
-    url: arc.Option[
-        str,
-        arc.StrParams(
-            name="url",
-            description="Git repo URL (e.g., https://github.com/user/repo.git)",
-        ),
-    ],
-) -> None:
-    await defer(ctx)
+@cmd_module.subcommand(
+    "load",
+    sub_cmd_description="Load module from Git URL",
+)
+@interactions.slash_option(
+    name="url",
+    description="Git repo URL (e.g., https://github.com/user/repo.git)",
+    required=True,
+    opt_type=interactions.OptionType.STRING,
+)
+async def cmd_load_mod(ctx: interactions.SlashContext, url: str) -> None:
+    await defer_safe(ctx)
     executor = ctx.user
 
     git_url, parsed_name, validated_url = parse_repo_url(url)
     if not validated_url or not parsed_name:
-        await reply_err(bot, ctx, "Failed to parse Git URL: invalid format.")
+        await reply_err(
+            client,
+            ctx,
+            "Failed to parse Git URL: invalid format.",
+        )
         return
 
     if (EXTENSIONS_DIR / parsed_name).is_dir():
         await reply_err(
-            bot,
+            client,
             ctx,
             f"Failed to load module: `{parsed_name}` already exists.",
         )
         return
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, f"Validating `{parsed_name}`", title=None)
+        await ctx.edit(content=f"Validating `{parsed_name}`")
 
-    remote_valid, remote_error_msg, _ = await check_remote_module(git_url)
+    remote_valid, remote_error_msg, _ = await check_remote_ext(git_url)
     if not remote_valid:
-        await reply_err(bot, ctx, f"Failed to validate module: {remote_error_msg}")
+        await reply_err(client, ctx, f"Failed to validate module: {remote_error_msg}")
         return
 
     await dm_role_members(
         ctx,
         embeds=[
-            await reply_embed(
-                bot,
+            await mk_embed(
+                client,
                 "Loading Module",
                 f"{executor.mention} is loading `{parsed_name}`.",
             ),
@@ -1641,36 +1246,36 @@ async def cmd_load_mod(
     )
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, f"Cloning `{parsed_name}`.", title=None)
+        await ctx.edit(content=f"Cloning `{parsed_name}`.")
 
     cloned_name, clone_success = await asyncio.to_thread(clone_repo, git_url)
     if not clone_success:
-        await reply_err(bot, ctx, f"Failed to clone repository `{cloned_name}`.")
+        await reply_err(client, ctx, f"Failed to clone repository: `{cloned_name}`.")
         return
 
     reqs_path = EXTENSIONS_DIR / cloned_name / "requirements.txt"
     if reqs_path.is_file():
         with contextlib.suppress(Exception):
-            await reply_ok(bot, ctx, "Installing dependencies.", title=None)
+            await ctx.edit(content="Installing dependencies.")
         pip_success = await asyncio.to_thread(run_pip, str(reqs_path), True)
         if not pip_success:
             await asyncio.to_thread(delete_module, cloned_name)
             await reply_err(
-                bot,
+                client,
                 ctx,
-                "Failed to install dependencies: module removed.",
+                "Failed to install dependencies: removed module.",
             )
             return
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, f"Loading `{cloned_name}`", title=None)
+        await ctx.edit(content=f"Loading `{cloned_name}`")
 
-    if await load_module(bot, cloned_name):
-        await reply_ok(bot, ctx, f"Loaded module `{cloned_name}`.")
+    if await load_module(client, cloned_name):
+        await reply_ok(client, ctx, f"Loading module `{cloned_name}`.")
         await dm_role_members(
             embeds=[
-                await reply_embed(
-                    bot,
+                await mk_embed(
+                    client,
                     "Module Loaded",
                     f"`{cloned_name}` loaded by {executor.mention}.",
                 ),
@@ -1678,55 +1283,27 @@ async def cmd_load_mod(
         )
 
 
-# --- Module Autocomplete ---
+# --- Module Option Decorator ---
 
 
-async def mod_autocomplete(
-    ctx: arc.context.autocomplete.AutocompleteData[arc.client.GatewayClient, str],
-) -> Sequence[str]:
-    query = (ctx.focused_value or "").lower() if ctx.focused_value else ""
-    choices: list[str]
-
-    try:
-        with os.scandir(EXTENSIONS_DIR) as entries:
-            valid_modules = [
-                entry.name
-                for entry in entries
-                if entry.is_dir() and entry.name != "__pycache__" and is_valid_repo(entry.name)
-            ]
-
-        matching = [m for m in valid_modules if query in m.lower()]
-        choices = sorted(matching)[:25]
-
-        if valid_modules and not matching and query:
-            choices = ["no_match"]
-        elif not valid_modules:
-            choices = ["none"]
-    except Exception:
-        logger.exception("Failed to autocomplete")
-        choices = ["error"]
-
-    return choices
+def mod_opt() -> Callable:
+    return interactions.slash_option(
+        name="module",
+        description="Module name",
+        required=True,
+        opt_type=interactions.OptionType.STRING,
+        autocomplete=True,
+    )
 
 
-# --- Unload Module Command ---
+# --- Command Module Unload ---
 
 
-@cmd_module.include()
-@arc.slash_subcommand(name="unload", description="Unload and delete a module")
-async def cmd_unload_mod(
-    ctx: arc.client.GatewayContext,
-    module: arc.Option[
-        str,
-        arc.StrParams(
-            name="module",
-            description="Module name",
-            autocomplete_with=mod_autocomplete,
-        ),
-    ],
-) -> None:
-    await defer(ctx)
-    executor = ctx.user
+@cmd_module.subcommand("unload", sub_cmd_description="Unload and delete a module")
+@mod_opt()
+async def cmd_unload_mod(ctx: interactions.SlashContext, module: str) -> None:
+    await defer_safe(ctx)
+    executor = ctx.author
 
     logger.info(
         "User %s (%s) requested unload of module: %s",
@@ -1738,26 +1315,26 @@ async def cmd_unload_mod(
     module_path = EXTENSIONS_DIR / module
     if not module_path.is_dir():
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Failed to locate module: directory `{module}` not found.",
+            f"Failed to locate directory: `{module}` not found.",
         )
         return
 
     if not is_valid_repo(module):
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"`{module}` is not a valid module repository.",
+            f"Failed to unload: `{module}` is not a valid module repository (or is the kernel).",
         )
         return
 
-    info, _ = get_module_info(module)
+    info, _ = get_ext_info(module)
     commit_id = str(info.cur_commit.id)[:7] if info and info.cur_commit else "Unknown"
     remote_url = info.url if info else "Unknown"
 
-    embed = await reply_embed(
-        bot,
+    embed = await mk_embed(
+        client,
         "Unloading Module",
         f"{executor.mention} is unloading `{module}`.",
         Color.WARN,
@@ -1767,7 +1344,7 @@ async def cmd_unload_mod(
     if ctx.member:
         embed.set_author(
             name=ctx.member.display_name,
-            icon=ctx.member.display_avatar_url,
+            icon_url=ctx.member.avatar_url,
         )
     await dm_role_members(ctx, embeds=[embed])
 
@@ -1775,21 +1352,21 @@ async def cmd_unload_mod(
     unload_success = True
 
     try:
-        arc_client.unload_extension(module_full_name)
+        client.unload_extension(module_full_name)
         logger.info("Unloaded extension '%s'", module_full_name)
     except Exception as e:
         unload_success = False
         logger.exception("Failed to unload extension '%s': %s", module_full_name, e)
         await reply_err(
-            bot,
+            client,
             ctx,
             f"Failed to unload extension `{module}`: {e}. Attempting cleanup.",
         )
 
     if unload_success:
         try:
-            if arc_client.is_started:
-                await arc_client.resync_commands()
+            if client.is_ready:
+                await client.synchronise_interactions(delete_commands=True)
                 logger.info("Resynced commands after extension unload")
         except Exception as e:
             logger.exception("Failed to resync commands after unload: %s", e)
@@ -1797,45 +1374,35 @@ async def cmd_unload_mod(
     delete_success = await asyncio.to_thread(delete_module, module)
 
     if delete_success:
-        final_message = f"Unloaded module `{module}` and removed its directory."
+        final_message = f"Unloading module `{module}` and removing its directory."
         if not unload_success:
-            final_message += " (Extension unload encountered issues, but cleanup completed.)"
-        await reply_ok(bot, ctx, final_message)
-        completion_embed = await reply_embed(
-            bot,
-            "Module Unloaded",
-            f"`{module}` unloaded and deleted by {executor.mention}.",
+            final_message += " (Extension unload encountered issues, but finished cleanup.)"
+        await reply_ok(client, ctx, final_message)
+        completion_embed = await mk_embed(
+            client,
+            "Unloading Module",
+            f"Unloading `{module}` and deleting by {executor.mention}.",
         )
         await dm_role_members(embeds=[completion_embed])
     else:
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Failed to delete directory for module `{module}`. Manual cleanup required.",
+            f"Failed to delete directory for module `{module}`: cleanup required.",
         )
 
 
-# --- Update Module Command ---
+# --- Command Module Update ---
 
 
-@cmd_module.include()
-@arc.slash_subcommand(
-    name="update",
-    description="Update a module to the latest version",
+@cmd_module.subcommand(
+    "update",
+    sub_cmd_description="Update a module to the latest version",
 )
-async def cmd_update_mod(
-    ctx: arc.client.GatewayContext,
-    module: arc.Option[
-        str,
-        arc.StrParams(
-            name="module",
-            description="Module name",
-            autocomplete_with=mod_autocomplete,
-        ),
-    ],
-) -> None:
-    await defer(ctx)
-    executor = ctx.user
+@mod_opt()
+async def cmd_update_mod(ctx: interactions.SlashContext, module: str) -> None:
+    await defer_safe(ctx)
+    executor = ctx.author
     module_dir = EXTENSIONS_DIR / module
     backup_base = BACKUP_DIR / module
     module_full_name = f"extensions.{module}.main"
@@ -1849,16 +1416,16 @@ async def cmd_update_mod(
 
     if not module_dir.is_dir():
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Failed to locate module: directory `{module}` not found.",
+            f"Failed to locate directory: `{module}` not found.",
         )
         return
 
-    info, valid_info = get_module_info(module)
+    info, valid_info = get_ext_info(module)
     if not valid_info or not info:
         await reply_err(
-            bot,
+            client,
             ctx,
             f"Failed to retrieve repository info for module `{module}`.",
         )
@@ -1866,9 +1433,9 @@ async def cmd_update_mod(
 
     if info.cur_commit and info.rmt_commit and info.cur_commit.id == info.rmt_commit.id and info.mods == 0:
         await reply_ok(
-            bot,
+            client,
             ctx,
-            f"Module `{module}` already up-to-date (no local modifications).",
+            f"Module `{module}` remains up-to-date.",
         )
         return
 
@@ -1883,8 +1450,8 @@ async def cmd_update_mod(
         info.mods,
     )
 
-    embed = await reply_embed(
-        bot,
+    embed = await mk_embed(
+        client,
         "Updating Module",
         f"{executor.mention} is updating `{module}`.",
         Color.WARN,
@@ -1897,12 +1464,12 @@ async def cmd_update_mod(
     if ctx.member:
         embed.set_author(
             name=ctx.member.display_name,
-            icon=ctx.member.display_avatar_url,
+            icon_url=ctx.member.avatar_url,
         )
     await dm_role_members(ctx, embeds=[embed])
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, f"Backing up module `{module}`.", title=None)
+        await ctx.edit(content=f"Backing up module `{module}`.")
 
     patch_path: str | None = None
     has_local_changes = False
@@ -1944,7 +1511,7 @@ async def cmd_update_mod(
             e,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
             f"Failed to create backup: {e}. Update aborted.",
         )
@@ -1995,7 +1562,9 @@ async def cmd_update_mod(
             return False
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, f"Pulling updates for module `{module}`.", title=None)
+        await ctx.edit(
+            content=f"Pulling updates for module `{module}`.",
+        )
 
     pull_result = await asyncio.to_thread(pull_module, module)
 
@@ -2014,20 +1583,22 @@ async def cmd_update_mod(
         )
         if await restore_backup():
             await reply_err(
-                bot,
+                client,
                 ctx,
                 f"Failed to update module: {error_msg}. Restored from backup.",
             )
         else:
             await reply_err(
-                bot,
+                client,
                 ctx,
-                f"Failed to update module: {error_msg}. CRITICAL: Backup restoration failed. Manual intervention required.",
+                f"Failed to update module: {error_msg}. Backup restoration failed. Intervention required.",
             )
         return
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, f"Updating dependencies for `{module}`.", title=None)
+        await ctx.edit(
+            content=f"Updating dependencies for `{module}`.",
+        )
 
     pip_success = await asyncio.to_thread(
         run_pip,
@@ -2042,52 +1613,65 @@ async def cmd_update_mod(
         )
         if await restore_backup():
             await reply_err(
-                bot,
+                client,
                 ctx,
                 f"Failed to update dependencies for `{module}`. Restored from backup.",
             )
         else:
             await reply_err(
-                bot,
+                client,
                 ctx,
-                f"Failed to update dependencies for `{module}`. CRITICAL: Backup restoration failed. Manual intervention required.",
+                f"Failed to update dependencies for `{module}`. Backup restoration failed. Intervention required.",
             )
         return
 
     with contextlib.suppress(Exception):
-        await reply_ok(
-            bot,
-            ctx,
-            f"Validating and reloading module `{module}`.",
-            title=None,
+        await ctx.edit(
+            content=f"Validating and reloading module `{module}`.",
         )
 
-    reload_success = await load_module(bot, module, is_reload=True)
+    reload_success = await load_module(client, module, is_reload=True)
 
     if not reload_success:
         logger.exception("Failed to reload module '%s' after update", module)
         if await restore_backup():
             logger.info("Loading restored version of module '%s'", module)
 
-            final_load_success = await load_module(bot, module, is_reload=False)
+            if module_full_name in client.ext:
+                logger.warning(
+                    f"Extension '{module_full_name}' still loaded despite failed reload",
+                )
+                try:
+                    client.unload_extension(module_full_name)
+                    await client.synchronise_interactions(delete_commands=True)
+                except Exception as unload_err:
+                    logger.exception(
+                        f"Failed to explicitly unload '{module_full_name}': {unload_err}",
+                    )
+            else:
+                logger.debug(
+                    f"Extension '{module_full_name}' not found in client.ext, no unload needed before loading restored version.",
+                )
+
+            final_load_success = await load_module(client, module, is_reload=False)
 
             if final_load_success:
                 await reply_err(
-                    bot,
+                    client,
                     ctx,
                     f"Failed to reload updated module `{module}`: previous version restored and loaded.",
                 )
             else:
                 await reply_err(
-                    bot,
+                    client,
                     ctx,
-                    f"Failed to reload updated module `{module}`: restored from backup but reload failed. Manual intervention required.",
+                    f"Failed to reload updated module `{module}`: restored from backup but reload failed. Intervention required.",
                 )
         else:
             await reply_err(
-                bot,
+                client,
                 ctx,
-                f"Failed to reload updated module `{module}`. CRITICAL: Backup restoration failed. Manual intervention required.",
+                f"Failed to reload updated module `{module}`. Backup restoration failed.",
             )
         with contextlib.suppress(Exception):
             if backup_base.exists():
@@ -2123,7 +1707,7 @@ async def cmd_update_mod(
                     logger.info("Git apply stderr: %s", stderr_str)
                 await ctx.respond(
                     "Reapplied local changes.",
-                    flags=hikari.MessageFlag.EPHEMERAL,
+                    ephemeral=True,
                 )
             else:
                 logger.exception(
@@ -2136,9 +1720,9 @@ async def cmd_update_mod(
                 if stderr_str:
                     logger.exception("Git apply stderr: %s", stderr_str)
                 await reply_err(
-                    bot,
+                    client,
                     ctx,
-                    f"Update completed but failed to reapply local changes. Changes preserved in `{patch_path}`.",
+                    f"Update finished but failed to reapply local changes. Changes preserved in `{patch_path}`.",
                     ephemeral=False,
                 )
         except Exception as patch_err:
@@ -2148,9 +1732,9 @@ async def cmd_update_mod(
                 patch_err,
             )
             await reply_err(
-                bot,
+                client,
                 ctx,
-                f"Update completed but failed to reapply local changes: {patch_err}",
+                f"Update finished but failed to reapply local changes: {patch_err}",
             )
 
     try:
@@ -2162,10 +1746,10 @@ async def cmd_update_mod(
                     errors="ignore",
                 )
 
-        result_embed = await reply_embed(
-            bot,
-            "Module Updated",
-            f"Updated module `{module}` to commit `{target_commit_id[:7]}`.",
+        result_embed = await mk_embed(
+            client,
+            "Updating Module",
+            f"Updating module `{module}` to commit `{target_commit_id[:7]}`.",
         )
 
         max_field_len = 1000
@@ -2182,27 +1766,23 @@ async def cmd_update_mod(
                 value=f"```md\n{chunk.strip() or 'No CHANGELOG available.'}\n```",
             )
 
-        pages = [result_embed]
-        navigator = nav.navigator.NavigatorView(
-            pages=pages,
-            timeout=180,
-            autodefer=True,
-        )
-        builder = await navigator.build_response_async(miru_client)
-        await ctx.respond_with_builder(builder)
-        miru_client.start_view(navigator)
+        paginator = Paginator.create_from_embeds(client, result_embed, timeout=180)
+        paginator.show_callback_button = True
+        paginator.show_select_menu = True
+        paginator.wrong_user_message = "Requester controls pagination."
+        await paginator.send(ctx)
 
-        completion_embed = await reply_embed(
-            bot,
-            "Module Updated",
-            f"`{module}` updated by {executor.mention}.",
+        completion_embed = await mk_embed(
+            client,
+            "Module Loaded",
+            f"Loaded `{module}` by {executor.mention}.",
         )
         await dm_role_members(embeds=[completion_embed])
 
     except Exception as e:
         logger.exception("Failed to send update confirmation: %s", e)
         await reply_ok(
-            bot,
+            client,
             ctx,
             f"Updated `{module}` but failed to display details.",
         )
@@ -2213,38 +1793,31 @@ async def cmd_update_mod(
             logger.info("Cleaned up backup '%s'", backup_base)
 
 
-# --- Module Info Command ---
+# --- Command Module Info ---
 
 
-@cmd_module.include()
-@arc.slash_subcommand(name="info", description="Show information about a loaded module")
-async def cmd_info_mod(
-    ctx: arc.client.GatewayContext,
-    module: arc.Option[
-        str,
-        arc.StrParams(
-            name="module",
-            description="Module name",
-            autocomplete_with=mod_autocomplete,
-        ),
-    ],
-) -> None:
-    await defer(ctx)
+@cmd_module.subcommand(
+    "info",
+    sub_cmd_description="Show information about a loaded module",
+)
+@mod_opt()
+async def cmd_info_mod(ctx: interactions.SlashContext, module: str) -> None:
+    await defer_safe(ctx)
 
-    info, valid = get_module_info(module)
+    info, valid = get_ext_info(module)
     if not valid or not info:
         await reply_err(
-            bot,
+            client,
             ctx,
-            f"Failed to locate module `{module}`: not found or invalid repository. Use `/kernel module list`.",
+            f"Not found or invalid `{module}`.",
         )
         return
 
     try:
         has_modifications = info.mods > 0
         embed_color = Color.WARN if has_modifications else Color.INFO
-        result_embed = await reply_embed(
-            bot,
+        result_embed = await mk_embed(
+            client,
             f"Module: `{module}`",
             f"Repository: {info.url}",
             embed_color,
@@ -2280,22 +1853,56 @@ async def cmd_info_mod(
                 field_name += f" (Part {i + 1}/{len(chunks)})"
             result_embed.add_field(name=field_name, value=f"```md\n{chunk}\n```")
 
-        pages = [result_embed]
-        navigator = nav.navigator.NavigatorView(
-            pages=pages,
-            timeout=180,
-            autodefer=True,
-        )
-        builder = await navigator.build_response_async(miru_client)
-        await ctx.respond_with_builder(builder)
-        miru_client.start_view(navigator)
+        paginator = Paginator.create_from_embeds(client, result_embed, timeout=180)
+        paginator.show_callback_button = True
+        paginator.show_select_menu = True
+        paginator.wrong_user_message = "User who requested this info can control the pagination."
+        await paginator.send(ctx)
 
     except Exception as e:
         logger.exception("Failed to send module info for '%s': %s", module, e)
-        await reply_err(bot, ctx, f"Failed to display module information: {e}.")
+        await reply_err(
+            client,
+            ctx,
+            f"Failed to display module information for {module}: {e}.",
+        )
 
 
-# --- List Modules Command ---
+# --- Command Module Autocomplete ---
+
+
+@cmd_unload_mod.autocomplete("module")
+@cmd_update_mod.autocomplete("module")
+@cmd_info_mod.autocomplete("module")
+async def cmd_module_name(
+    ctx: interactions.AutocompleteContext,
+) -> None:
+    query = (ctx.input_text or "").lower() if ctx.input_text else ""
+    choices: list[str]
+
+    try:
+        with os.scandir(EXTENSIONS_DIR) as entries:
+            valid_modules = [
+                entry.name
+                for entry in entries
+                if entry.is_dir() and entry.name != "__pycache__" and is_valid_repo(entry.name)
+            ]
+
+        matching = [m for m in valid_modules if query in m.lower()]
+        choices = sorted(matching)[:25]
+
+        if valid_modules and not matching and query:
+            choices = ["no_match"]
+        elif not valid_modules:
+            choices = ["none"]
+    except Exception:
+        logger.exception("Failed to autocomplete")
+        choices = ["error"]
+
+    await ctx.send(choices)
+
+
+# --- Command Modules List ---
 
 
 def get_loadable_mods() -> list[str]:
@@ -2312,23 +1919,22 @@ def get_loadable_mods() -> list[str]:
         return []
 
 
-@cmd_module.include()
-@arc.slash_subcommand(name="list", description="List all loaded modules")
-async def cmd_list_mods(ctx: arc.client.GatewayContext) -> None:
-    await defer(ctx)
+@cmd_module.subcommand("list", sub_cmd_description="List all loaded modules")
+async def cmd_list_mods(ctx: interactions.SlashContext) -> None:
+    await defer_safe(ctx)
 
     modules_list = get_loadable_mods()
 
     if not modules_list:
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Failed to locate any modules: extensions directory empty. Use `/kernel module load` to add modules.",
+            "Failed to locate extensions directory: empty.",
         )
         return
 
-    embed = await reply_embed(
-        bot,
+    embed = await mk_embed(
+        client,
         "Module List",
         f"Discovered {len(modules_list)} loadable modules:",
     )
@@ -2340,7 +1946,7 @@ async def cmd_list_mods(ctx: arc.client.GatewayContext) -> None:
             embed.set_footer(text=f"Displaying first {max_fields} modules.")
             break
         try:
-            info, valid = get_module_info(module_name)
+            info, valid = get_ext_info(module_name)
             if valid and info:
                 commit_id = str(info.cur_commit.id)[:7] if info.cur_commit else "N/A"
                 display_name = (
@@ -2374,48 +1980,47 @@ async def cmd_list_mods(ctx: arc.client.GatewayContext) -> None:
             field_count += 1
 
     try:
-        pages = [embed]
-        navigator = nav.navigator.NavigatorView(
-            pages=pages,
-            timeout=180,
-            autodefer=True,
-        )
-        builder = await navigator.build_response_async(miru_client)
-        await ctx.respond_with_builder(builder)
-        miru_client.start_view(navigator)
+        paginator = Paginator.create_from_embeds(client, embed, timeout=180)
+        paginator.show_callback_button = True
+        paginator.show_select_menu = True
+        paginator.wrong_user_message = "User who requested this list can control the pagination."
+        await paginator.send(ctx)
     except Exception as e:
         logger.exception("Failed to send module list: %s", e)
-        await reply_err(bot, ctx, f"Failed to display module list: {e}.")
+        await reply_err(
+            client,
+            ctx,
+            f"Failed to display module list: {e}.",
+        )
 
 
-# --- Download Command ---
+# --- Command Download ---
 
 
 _dl_lock = asyncio.Lock()
 
 
-@cmd_debug.include()
-@arc.slash_subcommand(
-    name="download",
-    description="Download current running code as tarball",
+@cmd_debug.subcommand(
+    "download",
+    sub_cmd_description="Download current running code as tarball",
 )
-async def cmd_download(ctx: arc.client.GatewayContext) -> None:
+async def cmd_download(ctx: interactions.SlashContext) -> None:
     if _dl_lock.locked():
         await ctx.respond(
-            "Download already in progress.",
-            flags=hikari.MessageFlag.EPHEMERAL,
+            "Download already in progress. Retry later.",
+            ephemeral=True,
         )
         return
 
     async with _dl_lock:
-        await defer(ctx)
+        await defer_safe(ctx)
         logger.info(
             "User %s (%s) requested code download",
             ctx.user.username,
             ctx.user.id,
         )
 
-        def _compress_code(filename: str, source_path: pathlib.Path) -> None:
+        def compress_code(filename: str, source_path: pathlib.Path) -> None:
             excluded_patterns = frozenset(
                 {
                     ".git",
@@ -2430,17 +2035,10 @@ async def cmd_download(ctx: arc.client.GatewayContext) -> None:
             )
 
             def tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-                path = pathlib.Path(tarinfo.name)
-                for part in path.parts:
-                    if part in excluded_patterns:
-                        logger.info("Excluding '%s' from archive", tarinfo.name)
-                        return None
-                    for pattern in excluded_patterns:
-                        if "*" in pattern and pathlib.PurePosixPath(part).match(
-                            pattern,
-                        ):
-                            logger.info("Excluding '%s' from archive", tarinfo.name)
-                            return None
+                path_parts = set(pathlib.Path(tarinfo.name).parts)
+                if any(pattern in path_parts for pattern in excluded_patterns):
+                    logger.info("Excluding '%s' from archive", tarinfo.name)
+                    return None
                 if pathlib.Path(tarinfo.name).name == pathlib.Path(filename).name:
                     return None
                 return tarinfo
@@ -2460,35 +2058,33 @@ async def cmd_download(ctx: arc.client.GatewayContext) -> None:
             async with aiofiles.tempfile.NamedTemporaryFile(
                 mode="wb",
                 suffix=".tar.zst",
-                prefix="Discord-Bot-Framework_",
+                prefix="Discord-client-Framework_",
                 delete=False,
             ) as tmp:
-                temp_name = tmp.name
-                if isinstance(temp_name, int):
-                    raise RuntimeError("Temporary file path is a file descriptor")
-                temp_file_path = os.fsdecode(os.fspath(temp_name))
-            if not temp_file_path:
-                raise RuntimeError("Temporary file path is empty")
+                temp_file_path_str: str = str(tmp.name)
 
-            await asyncio.to_thread(_compress_code, temp_file_path, BASE_DIR)
+            await asyncio.to_thread(compress_code, temp_file_path_str, BASE_DIR)
 
-            file_size = pathlib.Path(temp_file_path).stat().st_size
+            file_size = pathlib.Path(temp_file_path_str).stat().st_size
             logger.info(
                 "Sending archive '%s' (%d bytes)",
-                temp_file_path,
+                temp_file_path_str,
                 file_size,
             )
             await ctx.respond(
-                "Code archive attached:",
+                "Attaching code archive:",
                 attachments=[
-                    hikari.File(temp_file_path, filename="client_code.tar.zst"),
+                    interactions.File(
+                        temp_file_path_str,
+                        file_name="client_code.tar.zst",
+                    ),
                 ],
             )
 
         except Exception as e:
             logger.exception("Failed to complete code download")
             await reply_err(
-                bot,
+                client,
                 ctx,
                 f"Failed to complete download: {e}.",
             )
@@ -2502,18 +2098,17 @@ async def cmd_download(ctx: arc.client.GatewayContext) -> None:
                     )
 
 
-# --- Debug Info Command ---
+# --- Command Debug Info ---
 
 
-@cmd_debug.include()
-@arc.slash_subcommand(
-    name="info",
-    description="Show debugging information and system status",
+@cmd_debug.subcommand(
+    "info",
+    sub_cmd_description="Show information about status",
 )
-async def cmd_info(ctx: arc.client.GatewayContext) -> None:
-    await defer(ctx)
+async def cmd_info(ctx: interactions.SlashContext) -> None:
+    await defer_safe(ctx)
 
-    me = bot.get_me()
+    me = client.user
     system_info = {
         "python_version": sys.version.split()[0],
         "platform": sys.platform,
@@ -2522,18 +2117,18 @@ async def cmd_info(ctx: arc.client.GatewayContext) -> None:
         "log_file": (str(LOG_FILE.relative_to(BASE_DIR)) if LOG_FILE.is_relative_to(BASE_DIR) else str(LOG_FILE)),
     }
 
-    bot_info = {
+    client_info = {
         "user_id": me.id if me else "N/A",
         "username": me.username if me else "N/A",
-        "guild_count": len(bot.cache.get_guilds_view()),
+        "guild_count": len(client.guilds),
         "module_count": len(get_loadable_mods()),
-        "latency": f"{bot.heartbeat_latency * 1000:.2f} ms" if bot.heartbeat_latency else "N/A",
+        "latency": (f"{client.latency * 1000:.2f} ms" if client.latency is not None else "N/A"),
     }
 
-    embed = await reply_embed(
-        bot,
-        "System Status",
-        "Runtime diagnostics and bot information.",
+    embed = await mk_embed(
+        client,
+        "Status",
+        "Runtime diagnostics and client information.",
         Color.INFO,
     )
 
@@ -2542,15 +2137,16 @@ async def cmd_info(ctx: arc.client.GatewayContext) -> None:
         value=f"- Python: `{system_info['python_version']}`\n"
         f"- Platform: `{system_info['platform']}`\n"
         f"- PID: `{system_info['pid']}`\n"
+        f"- CWD: `{system_info['cwd']}`\n"
         f"- Log: `{system_info['log_file']}`",
         inline=True,
     )
     embed.add_field(
-        name="Bot",
-        value=f"- User: `{bot_info['username']}` ({bot_info['user_id']})\n"
-        f"- Guilds: `{bot_info['guild_count']}`\n"
-        f"- Modules: `{bot_info['module_count']}`\n"
-        f"- Latency: `{bot_info['latency']}`",
+        name="client",
+        value=f"- User: `{client_info['username']}` ({client_info['user_id']})\n"
+        f"- Guilds: `{client_info['guild_count']}`\n"
+        f"- Modules: `{client_info['module_count']}`\n"
+        f"- Latency: `{client_info['latency']}`",
         inline=True,
     )
 
@@ -2570,35 +2166,34 @@ async def cmd_info(ctx: arc.client.GatewayContext) -> None:
         logger.exception("Failed to list log files: %s", e)
 
     try:
-        pages = [embed]
-        navigator = nav.navigator.NavigatorView(
-            pages=pages,
-            timeout=180,
-            autodefer=True,
-        )
-        builder = await navigator.build_response_async(miru_client)
-        await ctx.respond_with_builder(builder)
-        miru_client.start_view(navigator)
+        paginator = Paginator.create_from_embeds(client, embed, timeout=180)
+        paginator.show_callback_button = True
+        paginator.show_select_menu = True
+        paginator.wrong_user_message = "User who requested this info can control the pagination."
+        await paginator.send(ctx)
     except Exception as e:
         logger.exception("Failed to send system status: %s", e)
-        await reply_err(bot, ctx, f"Failed to display system status: {e}.")
+        await reply_err(
+            client,
+            ctx,
+            f"Failed to display system status: {e}.",
+        )
 
 
-# --- Kernel Info Command ---
+# --- Command Kernel Info ---
 
 
-@cmd_review.include()
-@arc.slash_subcommand(
-    name="info",
-    description="Show information about the Kernel (main bot code)",
+@cmd_kernel.subcommand(
+    "info",
+    sub_cmd_description="Show information about the Kernel",
 )
-async def cmd_info_kernel(ctx: arc.client.GatewayContext) -> None:
-    await defer(ctx)
+async def cmd_info_kernel(ctx: interactions.SlashContext) -> None:
+    await defer_safe(ctx)
 
     info = get_kernel_info()
     if not info:
         await reply_err(
-            bot,
+            client,
             ctx,
             "Failed to retrieve kernel repository information.",
         )
@@ -2606,10 +2201,10 @@ async def cmd_info_kernel(ctx: arc.client.GatewayContext) -> None:
 
     try:
         color = Color.WARN if info.mods > 0 else Color.INFO
-        embed = await reply_embed(
-            bot,
+        embed = await mk_embed(
+            client,
             "Kernel",
-            f"Repository: {info.url}",
+            f"Repo: {info.url}",
             color,
         )
         embed.url = info.url
@@ -2634,31 +2229,30 @@ async def cmd_info_kernel(ctx: arc.client.GatewayContext) -> None:
             inline=True,
         )
 
-        pages = [embed]
-        navigator = nav.navigator.NavigatorView(
-            pages=pages,
-            timeout=180,
-            autodefer=True,
-        )
-        builder = await navigator.build_response_async(miru_client)
-        await ctx.respond_with_builder(builder)
-        miru_client.start_view(navigator)
+        paginator = Paginator.create_from_embeds(client, embed, timeout=180)
+        paginator.show_callback_button = True
+        paginator.show_select_menu = True
+        paginator.wrong_user_message = "User who requested this info can control the pagination."
+        await paginator.send(ctx)
 
     except Exception as e:
-        logger.exception("Failed to send kernel information: %s", e)
-        await reply_err(bot, ctx, f"Failed to display kernel information: {e}.")
+        logger.exception("Failed to send kernel information")
+        await reply_err(
+            client,
+            ctx,
+            f"Failed to display kernel information: {e}.",
+        )
 
 
-# --- Update Kernel Command ---
+# --- Command Kernel Update ---
 
 
-@cmd_review.include()
-@arc.slash_subcommand(
-    name="update",
-    description="Update the kernel to the latest version",
+@cmd_kernel.subcommand(
+    "update",
+    sub_cmd_description="Update the kernel to the latest version",
 )
-async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
-    await defer(ctx)
+async def cmd_kernel_update(ctx: interactions.SlashContext) -> None:
+    await defer_safe(ctx)
     executor = ctx.user
 
     logger.info(
@@ -2670,7 +2264,7 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
     info = get_kernel_info()
     if not info:
         await reply_err(
-            bot,
+            client,
             ctx,
             "Failed to retrieve kernel repository information.",
         )
@@ -2678,9 +2272,9 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
 
     if info.cur_commit and info.rmt_commit and info.cur_commit.id == info.rmt_commit.id and info.mods == 0:
         await reply_ok(
-            bot,
+            client,
             ctx,
-            "Kernel already up-to-date (no local modifications).",
+            "Kernel remains up-to-date.",
         )
         return
 
@@ -2688,14 +2282,14 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
     target_commit_id = str(info.rmt_commit.id) if info.rmt_commit else "Unknown"
 
     logger.info(
-        "Initiated kernel update: cur=%s target=%s mods=%d",
+        "Initiating kernel update: cur=%s target=%s mods=%d",
         current_commit_id,
         target_commit_id,
         info.mods,
     )
 
-    embed = await reply_embed(
-        bot,
+    embed = await mk_embed(
+        client,
         "Updating Kernel",
         f"{executor.mention} is updating kernel.",
         Color.WARN,
@@ -2705,18 +2299,18 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
     embed.add_field(name="Target Commit", value=f"`{target_commit_id}`", inline=True)
     if info.mods > 0:
         embed.add_field(
-            name="Warning",
+            name="WARNING",
             value="Local modifications detected and will be overwritten.",
         )
     if ctx.member:
         embed.set_author(
             name=ctx.member.display_name,
-            icon=ctx.member.display_avatar_url,
+            icon_url=ctx.member.avatar_url,
         )
     await dm_role_members(ctx, embeds=[embed])
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, "Pulling kernel updates.", title=None)
+        await ctx.edit(content="Pulling kernel updates.")
 
     pull_result = await asyncio.to_thread(pull_kernel)
 
@@ -2733,14 +2327,14 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
             pull_result,
         )
         await reply_err(
-            bot,
+            client,
             ctx,
             f"Failed to update kernel: {error_msg}.",
         )
         return
 
     with contextlib.suppress(Exception):
-        await reply_ok(bot, ctx, "Updating kernel dependencies.", title=None)
+        await ctx.edit(content="Updating kernel dependencies.")
 
     pip_success = await asyncio.to_thread(
         run_pip,
@@ -2751,27 +2345,22 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
     if not pip_success:
         logger.exception("Failed to update kernel dependencies")
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Kernel updated but dependency update failed. Bot may be unstable. Check logs and requirements.txt.",
+            "Kernel updated but failed to update dependencies.",
         )
-    else:
-        logger.info("Updated kernel dependencies")
 
     with contextlib.suppress(Exception):
-        await reply_ok(
-            bot,
-            ctx,
-            "Kernel update complete. Signaling restart now.",
-            title=None,
+        await ctx.edit(
+            content="Kernel update finished.",
         )
 
-    result_embed = await reply_embed(
-        bot,
-        "Kernel Updated",
-        f"Updated to `{target_commit_id[:7]}`. Restarting.",
+    result_embed = await mk_embed(
+        client,
+        "Updating Kernel",
+        f"Updating to `{target_commit_id[:7]}`. Restarting.",
     )
-    await response(ctx, embeds=[result_embed])
+    await ctx.edit(embeds=[result_embed])
 
     try:
         FLAG_DIR.mkdir(exist_ok=True)
@@ -2780,10 +2369,10 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
             f"Restart triggered post-kernel-update at {datetime.datetime.now(datetime.timezone.utc).isoformat()} by {executor.id}",
         )
         logger.info("Set restart flag at %s", reboot_flag)
-        reboot_notice_embed = await reply_embed(
-            bot,
+        reboot_notice_embed = await mk_embed(
+            client,
             "Restarting",
-            "Kernel updated. Bot restarting.",
+            "Kernel updated. Restarting client.",
         )
         await dm_role_members(embeds=[reboot_notice_embed])
     except Exception:
@@ -2791,9 +2380,9 @@ async def cmd_update_kernel(ctx: arc.client.GatewayContext) -> None:
             "Failed to signal restart after kernel update",
         )
         await reply_err(
-            bot,
+            client,
             ctx,
-            "Kernel updated but restart signaling failed. Manual restart required.",
+            "Failed to restart client: restart signaling failed. Restart required.",
         )
 
 
@@ -2823,10 +2412,10 @@ async def main() -> None:
         pending_tasks: set[asyncio.Task] = {task for task in asyncio.all_tasks() if task is not current_task}
 
         with contextlib.suppress(Exception):
-            if bot and bot.is_alive:
-                logger.warning("Closing bot connection")
-                await bot.close()
-                logger.warning("Closed bot connection")
+            if client and client._closed:
+                logger.warning("Closing client connection")
+                await client.stop()
+                logger.warning("Closed client connection")
 
         if not pending_tasks:
             logger.warning("Found no outstanding tasks to cancel")
@@ -2888,11 +2477,11 @@ async def main() -> None:
             module_name = module_parts[-2] if module_parts[-1] == "main" else module_parts[-1]
             try:
                 if extension_module.endswith(".main"):
-                    (loaded_extensions if await load_module(bot, module_name) else failed_extensions).add(
+                    (loaded_extensions if await load_module(client, module_name) else failed_extensions).add(
                         extension_module,
                     )
                 else:
-                    arc_client.load_extension(extension_module)
+                    client.load_extension(extension_module)
                     logger.info("Loaded extension '%s'", extension_module)
                     loaded_extensions.add(extension_module)
             except Exception:
@@ -2908,12 +2497,12 @@ async def main() -> None:
 
     try:
         await asyncio.gather(
-            bot.start(),
+            client.astart(),
             shutdown_event.wait(),
             return_exceptions=True,
         )
     except Exception:
-        logger.exception("Failed to start bot client")
+        logger.exception("Failed to start client client")
 
 
 def entrypoint() -> None:
