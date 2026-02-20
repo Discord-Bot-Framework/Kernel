@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import sys
 import typing
+import inspect
 
 from src.container.app import get_arc
 from src.container.types import ModuleType
@@ -198,7 +199,7 @@ class PythonModule(Module):
             if callable_obj is None:
                 return {"error": f"Method '{method}' not found in module"}
 
-            if asyncio.iscoroutinefunction(callable_obj):
+            if inspect.iscoroutinefunction(callable_obj):
                 result = await callable_obj(**payload)
             else:
                 result = callable_obj(**payload)

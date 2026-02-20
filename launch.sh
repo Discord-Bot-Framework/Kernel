@@ -25,9 +25,9 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v bun >/dev/null 2>&1; then
-  printf 'Not found: Bun\n' >&2
-fi
+# if ! command -v bun >/dev/null 2>&1; then
+#   printf 'Not found: Bun\n' >&2
+# fi
 
 if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"

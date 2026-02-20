@@ -27,11 +27,10 @@ include disable-interpreters.inc
 include disable-proc.inc
 include disable-programs.inc
 include disable-shell.inc
-include disable-X11.inc
+include disable-x11.inc
 include disable-xdg.inc
 
 caps.drop all
-caps.keep none
 
 netfilter
 protocol unix,inet,inet6
@@ -47,8 +46,6 @@ nodbus
 
 seccomp
 seccomp.block-secondary
-
-shell none
 
 disable-mnt
 private-cache

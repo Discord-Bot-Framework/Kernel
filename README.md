@@ -84,7 +84,7 @@ To apply configuration changes:
 | `launch.sh`           | Launch script                      |
 | `firejail.profile`    | Firejail configuration             |
 | `main.py`             | Entry point                        |
-| `main.log`            | Log output                         |
+| `kernel.log`          | Log output                         |
 | `src/`                | Framework                          |
 | `extensions/`         | User-defined modules               |
 

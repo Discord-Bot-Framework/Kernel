@@ -13,6 +13,14 @@ import hikari
 import miru
 import uvloop
 
+from src.commands.app.cmd import (
+    autocomplete_app_cmd,
+    cmd_app_delete,
+    cmd_app_info,
+    cmd_app_scope,
+    cmd_app_search,
+)
+from src.commands.app.exec import cmd_app_exec
 from src.commands.debug.download import cmd_debug_download
 from src.commands.debug.export import autocomplete_debug_export, cmd_debug_export
 from src.commands.debug.info import cmd_debug_info
@@ -30,27 +38,16 @@ from src.container.app import get_arc, init_app
 from src.container.types import ModuleType
 from src.modules.registry import registry
 from src.shared.constants import EXTENSIONS_DIR, SHUTDOWN_EVENT, TOKEN
-from src.commands.app.cmd import (
-    autocomplete_app_cmd,
-    cmd_app_delete,
-    cmd_app_info,
-    cmd_app_scope,
-    cmd_app_search,
-)
-from src.commands.app.exec import cmd_app_exec
-from src.shared.utils.jurigged import setup as setup_jurigged
 from src.shared.error import error_handler
-from src.shared.logger import get_module_logger
+from src.shared.logger import logger
 from src.shared.utils.client import make_arc_client, make_hikari_client
+from src.shared.utils.jurigged import setup as setup_jurigged
 from src.shared.utils.package import import_package
 
 uvloop.install()
 
 if typing.TYPE_CHECKING:
     from src.shared.utils.jurigged import Jurigged
-    import logging
-
-logger: logging.Logger = get_module_logger(__file__, __name__, "kernel.log")
 
 
 if not TOKEN:
@@ -122,11 +119,7 @@ async def on_arc_starting(client: arc.GatewayClient) -> None:
         with os.scandir(EXTENSIONS_DIR) as entries:
             for entry in entries:
                 entry_name = entry.name
-                if (
-                    entry.is_file()
-                    and entry_name.endswith(".py")
-                    and not entry_name.startswith("_")
-                ):
+                if entry.is_file() and entry_name.endswith(".py") and not entry_name.startswith("_"):
                     discovered_modules.add(f"extensions.{entry_name[:-3]}")
                 elif entry.is_dir() and entry_name != "__pycache__":
                     entry_path = EXTENSIONS_DIR / entry_name
@@ -145,9 +138,7 @@ async def on_arc_starting(client: arc.GatewayClient) -> None:
 
         for extension_module in extension_modules:
             module_parts = extension_module.rsplit(".", 2)
-            module_name = (
-                module_parts[-2] if module_parts[-1] == "main" else module_parts[-1]
-            )
+            module_name = module_parts[-2] if module_parts[-1] == "main" else module_parts[-1]
 
             try:
                 if extension_module.endswith(".main"):
@@ -540,11 +531,7 @@ async def main() -> None:
 
         current = asyncio.current_task()
         excluded = {current} if current is not None else set()
-        pending_tasks = {
-            task
-            for task in asyncio.all_tasks()
-            if task not in excluded and not task.done()
-        }
+        pending_tasks = {task for task in asyncio.all_tasks() if task not in excluded and not task.done()}
         if pending_tasks:
             logger.info("Cancelling %d outstanding tasks", len(pending_tasks))
             original_limit = sys.getrecursionlimit()
