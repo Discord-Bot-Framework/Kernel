@@ -44,18 +44,19 @@ from src.shared.utils.client import make_arc_client, make_hikari_client
 from src.shared.utils.jurigged import setup as setup_jurigged
 from src.shared.utils.package import import_package
 
-uvloop.install()
-
 if typing.TYPE_CHECKING:
     from src.shared.utils.jurigged import Jurigged
 
 
-if not TOKEN:
+uvloop.install()
+
+if TOKEN is None or TOKEN == "":
     logger.info("Failed to load bot token")
     sys.exit(1)
 
 
-hikari_client: hikari.GatewayBot = make_hikari_client(TOKEN)
+token: str = typing.cast("str", TOKEN)
+hikari_client: hikari.GatewayBot = make_hikari_client(token)
 arc_client: arc.GatewayClient = make_arc_client(hikari_client)
 miru_client: miru.Client = miru.Client.from_arc(arc_client)
 jurigged_service: Jurigged | None = None
@@ -70,18 +71,12 @@ with contextlib.suppress(OSError):
 import_package("src")
 
 
-# --- Error ---
-
-
 @get_arc().set_error_handler
 async def error_handler_wrapper(
     ctx: arc.GatewayContext,
     error: Exception,
 ) -> None:
     await error_handler(ctx, error)
-
-
-# --- Events ---
 
 
 @hikari_client.listen()
@@ -119,12 +114,23 @@ async def on_arc_starting(client: arc.GatewayClient) -> None:
         with os.scandir(EXTENSIONS_DIR) as entries:
             for entry in entries:
                 entry_name = entry.name
-                if entry.is_file() and entry_name.endswith(".py") and not entry_name.startswith("_"):
+                if entry_name.startswith(".") or entry_name == "__pycache__":
+                    continue
+
+                if (
+                    entry.is_file()
+                    and entry_name.endswith(".py")
+                    and not entry_name.startswith("_")
+                ):
                     discovered_modules.add(f"extensions.{entry_name[:-3]}")
-                elif entry.is_dir() and entry_name != "__pycache__":
+                    continue
+
+                if entry.is_dir():
                     entry_path = EXTENSIONS_DIR / entry_name
                     if (entry_path / ModuleType.PYTHON.entry_file).is_file():
                         discovered_modules.add(f"extensions.{entry_name}.main")
+    except FileNotFoundError:
+        logger.info("Extensions directory not found: %s", EXTENSIONS_DIR)
     except OSError:
         logger.exception("Failed to discover extensions directory")
 
@@ -137,8 +143,10 @@ async def on_arc_starting(client: arc.GatewayClient) -> None:
         failed: set[str] = set()
 
         for extension_module in extension_modules:
-            module_parts = extension_module.rsplit(".", 2)
-            module_name = module_parts[-2] if module_parts[-1] == "main" else module_parts[-1]
+            if extension_module.endswith(".main"):
+                module_name = extension_module.split(".")[-2]
+            else:
+                module_name = extension_module.split(".")[-1]
 
             try:
                 if extension_module.endswith(".main"):
@@ -178,8 +186,6 @@ async def on_arc_started(event: arc.StartedEvent) -> None:
     logger.info("Started arc client %s", event.client)
 
 
-# --- Commands ---
-
 cmd_group = get_arc().include_slash_group("bot", "Bot commands")
 hook_cmd_group(cmd_group)
 
@@ -193,7 +199,6 @@ hook_cmd_subgroup(cmd_debug)
 hook_cmd_subgroup(cmd_app)
 
 
-# Debug commands
 @cmd_debug.include()
 @arc.slash_subcommand(
     name="download",
@@ -237,7 +242,6 @@ async def cmd_debug_restart_wrapper(ctx: arc.GatewayContext) -> None:
     await cmd_debug_restart(ctx)
 
 
-# App commands
 @cmd_app.include()
 @arc.slash_subcommand(
     name="exec",
@@ -352,7 +356,6 @@ async def cmd_app_delete_wrapper(
     )
 
 
-# Kernel commands
 @cmd_kernel.include()
 @arc.slash_subcommand(
     name="info",
@@ -371,7 +374,6 @@ async def cmd_kernel_update_wrapper(ctx: arc.GatewayContext) -> None:
     await cmd_kernel_update(ctx)
 
 
-# Module commands
 @cmd_module.include()
 @arc.slash_subcommand(name="info", description="Show information about a loaded module")
 async def cmd_module_info_wrapper(
@@ -444,22 +446,24 @@ async def cmd_module_update_wrapper(
     await cmd_module_update(ctx, module)
 
 
-# --- Main Execution ---
-
 _shutdown_started: bool = False
 
 
-async def _request_shutdown(reason: str) -> None:
+async def request_shutdown(reason: str) -> None:
     global _shutdown_started
     if _shutdown_started:
         return
     _shutdown_started = True
-    logger.info("Shutdown requested: %s", reason)
+    logger.info("Requesting shutdown: %s", reason)
     SHUTDOWN_EVENT.set()
     with contextlib.suppress(Exception):
         if hikari_client.is_alive:
-            logger.info("Closing bot connection")
-            await hikari_client.close()
+            logger.info("Attempting graceful shutdown")
+            try:
+                await asyncio.wait_for(hikari_client.close(), timeout=5.0)
+                logger.info("Completed graceful shutdown")
+            except asyncio.TimeoutError:
+                logger.warning("Graceful shutdown timed out after 5 seconds")
             logger.info("Closed bot connection")
 
 
@@ -475,18 +479,18 @@ async def main() -> None:
         exception = context.get("exception")
         if isinstance(exception, BaseException):
             logger.exception(
-                "Unhandled event loop exception: %s",
+                "Handled unhandled event loop exception: %s",
                 exception,
                 exc_info=exception,
             )
             return
         message = context.get("message")
-        logger.exception("Unhandled event loop error: %s", message)
+        logger.exception("Handled unhandled event loop error: %s", message)
 
     event_loop.set_exception_handler(exception_handler)
 
     def dispatch_shutdown(signal_type: signal.Signals) -> None:
-        asyncio.create_task(_request_shutdown(reason=f"Received {signal_type.name}"))
+        asyncio.create_task(request_shutdown(reason=f"Received {signal_type.name}"))
 
     for signal_type in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
@@ -496,54 +500,37 @@ async def main() -> None:
                 signal_type,
             )
 
+    join_task: asyncio.Task[object] | None = None
+
     try:
         await hikari_client.start()
 
-        shutdown_wait_task = asyncio.create_task(SHUTDOWN_EVENT.wait())
         join_task = asyncio.create_task(hikari_client.join())
-        orchestration_tasks: tuple[asyncio.Task[object], ...] = (
-            shutdown_wait_task,
-            join_task,
-        )
-
-        done, pending = await asyncio.wait(
-            orchestration_tasks,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if join_task in done:
-            join_error = join_task.exception()
-            if join_error is not None:
-                logger.exception("Bot join exited with exception", exc_info=join_error)
-            await _request_shutdown("Bot connection closed")
-
-        if shutdown_wait_task in pending:
-            shutdown_wait_task.cancel()
-            await asyncio.gather(shutdown_wait_task, return_exceptions=True)
+        await join_task
+        join_error = join_task.exception()
+        if join_error is not None:
+            logger.exception("Failed to join bot", exc_info=join_error)
+        await request_shutdown("Bot connection closed")
+    except asyncio.CancelledError:
+        logger.info("Main runtime loop cancelled; requesting shutdown")
+        await request_shutdown("Main runtime loop cancelled")
     except Exception:
-        logger.exception("Failed during bot runtime")
-        await _request_shutdown("Runtime failure")
+        logger.exception("Failed to run bot")
+        await request_shutdown("Runtime failure")
     finally:
+        cleanup_tasks = tuple(
+            task for task in (join_task,) if task is not None and not task.done()
+        )
+        for task in cleanup_tasks:
+            task.cancel()
+        for task in cleanup_tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
         if jurigged_service is not None:
             with contextlib.suppress(Exception):
                 await jurigged_service.stop()
             jurigged_service = None
-
-        current = asyncio.current_task()
-        excluded = {current} if current is not None else set()
-        pending_tasks = {task for task in asyncio.all_tasks() if task not in excluded and not task.done()}
-        if pending_tasks:
-            logger.info("Cancelling %d outstanding tasks", len(pending_tasks))
-            original_limit = sys.getrecursionlimit()
-            try:
-                sys.setrecursionlimit(
-                    max(original_limit, len(pending_tasks) * 100 + 1000),
-                )
-                for task in pending_tasks:
-                    task.cancel()
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
-            finally:
-                sys.setrecursionlimit(original_limit)
 
 
 def entrypoint() -> None:
@@ -556,3 +543,4 @@ def entrypoint() -> None:
 
 if __name__ == "__main__":
     entrypoint()
+
