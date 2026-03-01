@@ -20,3 +20,5 @@ uvloop
 speedups
 
 lmdb
+
+cinderx

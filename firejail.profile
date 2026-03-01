@@ -60,5 +60,3 @@ noexec /dev/shm
 noexec /run/shm
 
 restrict-namespaces
-
-rlimit-cpu 0

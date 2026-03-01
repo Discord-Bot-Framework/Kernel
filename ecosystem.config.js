@@ -6,7 +6,7 @@ module.exports = {
       cwd: __dirname,
       watch: ["./flag/"],
       watch_delay: 1,
-      ignore_watch: ["node_modules", ".git", ".venv", "__pycache__", ".bak"],
+      ignore_watch: [".git", ".venv", "__pycache__", ".bak"],
       log_file: "/tmp/kernel.log",
       error_file: "/tmp/error.log",
       out_file: "/tmp/out.log",

@@ -88,7 +88,9 @@ def get_module_logger(
     log_path = module_dir / log_filename
     return _get_logger(log_path, module_name)
 
-logger: logging.Logger = (lambda: _get_logger(
-    pathlib.Path(__file__).resolve().parent.parent.parent / "kernel.log", 
-    __name__
-))()
+
+logger: logging.Logger = (
+    lambda: _get_logger(
+        pathlib.Path(__file__).resolve().parent.parent.parent / "kernel.log", __name__
+    )
+)()
