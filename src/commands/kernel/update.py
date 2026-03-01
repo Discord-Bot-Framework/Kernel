@@ -1,8 +1,10 @@
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import datetime
+import os
 from typing import TYPE_CHECKING
 
 from src.container.app import get_hikari
@@ -197,6 +199,8 @@ async def cmd_kernel_update(ctx: arc.GatewayContext) -> None:
             "Kernel updated. Bot restarting.",
         )
         await dm_role_members(embeds=[reboot_notice_embed])
+        logger.info("Scheduling process exit for kernel restart")
+        asyncio.get_running_loop().call_later(0.5, os._exit, 0)
     except Exception:
         logger.exception("Failed to signal restart after kernel update")
         await reply_err(
