@@ -325,6 +325,7 @@ async def cmd_module_update(
                 ctx,
                 f"Failed to update module: {error_msg}. CRITICAL: Backup restoration failed. Manual intervention required.",
             )
+        await _cleanup_backup(backup_base)
         return
 
     await _progress(hikari_client, ctx, f"Updating dependencies for `{module}`.")
@@ -348,6 +349,7 @@ async def cmd_module_update(
                 ctx,
                 f"Failed to update dependencies for `{module}`. CRITICAL: Backup restoration failed. Manual intervention required.",
             )
+        await _cleanup_backup(backup_base)
         return
 
     await _progress(hikari_client, ctx, f"Validating and reloading module `{module}`.")
@@ -384,7 +386,7 @@ async def cmd_module_update(
         await _cleanup_backup(backup_base)
         return
 
-    if has_local_changes and patch_path and anyio.Path(patch_path).exists():
+    if has_local_changes and patch_path and await anyio.Path(patch_path).exists():
         await _apply_local_patch(hikari_client, ctx, module, module_dir, patch_path)
 
     try:
@@ -451,3 +453,4 @@ async def cmd_module_update(
             logger.exception("Failed to send module update completion notification")
 
     await _cleanup_backup(backup_base)
+
