@@ -52,7 +52,7 @@ async def _respond_code_chunks(
     ctx: miru.ModalContext,
     source: str,
 ) -> None:
-    chunks = _split_chunks(source, _MAX_CODE_PAYLOAD)
+    chunks = _split_chunks(_sanitize_output(source), _MAX_CODE_PAYLOAD)
     for chunk in chunks:
         await ctx.respond(
             f"```py\n{chunk}\n```",
@@ -114,7 +114,7 @@ class _DebugExecModal(miru.Modal):
             "bot": get_hikari(),
             "__name__": "__debug_exec__",
         }
-        env.update(globals())
+        env.update({k: v for k, v in globals().items() if k != "TOKEN"})
 
         stdout = io.StringIO()
         to_compile = "async def __debug_exec_func__():\n{}".format(
@@ -140,7 +140,8 @@ class _DebugExecModal(miru.Modal):
 
         try:
             with redirect_stdout(stdout):
-                result = await typing.cast("typing.Awaitable[object]", func_obj())
+                awaitable = typing.cast("typing.Awaitable[object]", func_obj())
+                result = await awaitable
         except Exception:
             await _respond_code_chunks(
                 ctx,
@@ -217,3 +218,4 @@ async def cmd_app_exec(ctx: arc.GatewayContext) -> None:
     except Exception as exc:
         logger.exception("Failed to open debug exec modal")
         await reply_err(get_hikari(), ctx, f"Failed to open debug exec modal: {exc}")
+
