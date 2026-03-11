@@ -4,7 +4,7 @@ import asyncio
 import enum
 import os
 import pathlib
-import typing
+from typing import Final
 
 from dotenv import load_dotenv
 
@@ -24,19 +24,17 @@ def _env_int(name: str, default: int = 0) -> int:
     return parsed
 
 
-BASE_DIR: typing.Final[pathlib.Path] = pathlib.Path(
-    __file__,
-).parent.parent.parent.resolve()
-LOG_FILE: typing.Final[pathlib.Path] = BASE_DIR / "main.log"
-BACKUP_DIR: typing.Final[pathlib.Path] = BASE_DIR / ".bak"
-EXTENSIONS_DIR: typing.Final[pathlib.Path] = BASE_DIR / "extensions"
-FLAG_DIR: typing.Final[pathlib.Path] = BASE_DIR / "flag"
+BASE_DIR: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parents[2]
+LOG_FILE: Final[pathlib.Path] = BASE_DIR / "main.log"
+BACKUP_DIR: Final[pathlib.Path] = BASE_DIR / ".bak"
+EXTENSIONS_DIR: Final[pathlib.Path] = BASE_DIR / "extensions"
+FLAG_DIR: Final[pathlib.Path] = BASE_DIR / "flag"
 
-GUILD_ID: typing.Final[int] = _env_int("GUILD_ID")
-ROLE_ID: typing.Final[int] = _env_int("ROLE_ID")
-TOKEN: typing.Final[str | None] = os.getenv("TOKEN")
+GUILD_ID: Final[int] = _env_int("GUILD_ID")
+ROLE_ID: Final[int] = _env_int("ROLE_ID")
+TOKEN: Final[str | None] = os.getenv("TOKEN")
 
-SHUTDOWN_EVENT: asyncio.Event = asyncio.Event()
+SHUTDOWN_EVENT: Final[asyncio.Event] = asyncio.Event()
 
 
 class Color(enum.IntEnum):

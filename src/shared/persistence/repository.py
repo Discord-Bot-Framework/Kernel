@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from src.shared.persistence.constants import MSGPACK_DECODE_ERRORS
 from src.shared.persistence.store import (
+    LmdbEnvironment,
     Msgpack,
     Store,
     pack_msgpack,
@@ -13,20 +14,15 @@ from src.shared.persistence.store import (
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    import lmdb
-
 
 def list_mapping_records(
-    env: lmdb.Environment | None,
+    env: LmdbEnvironment | None,
     store: Store,
     db_name: str,
     *,
     strict_map_key: bool = True,
 ) -> list[dict[str, Msgpack]]:
-    if env is None:
-        return []
-    db = store.get_db(db_name)
-    if db is None:
+    if env is None or (db := store.get_db(db_name)) is None:
         return []
 
     result: list[dict[str, Msgpack]] = []
@@ -43,17 +39,14 @@ def list_mapping_records(
 
 
 def get_mapping_record(
-    env: lmdb.Environment | None,
+    env: LmdbEnvironment | None,
     store: Store,
     db_name: str,
     key: bytes,
     *,
     strict_map_key: bool = True,
 ) -> dict[str, Msgpack] | None:
-    if env is None:
-        return None
-    db = store.get_db(db_name)
-    if db is None:
+    if env is None or (db := store.get_db(db_name)) is None:
         return None
 
     with env.begin(db=db) as txn:
@@ -68,16 +61,13 @@ def get_mapping_record(
 
 
 def put_mapping_record(
-    env: lmdb.Environment | None,
+    env: LmdbEnvironment | None,
     store: Store,
     db_name: str,
     key: bytes,
     payload: Mapping[str, Msgpack],
 ) -> None:
-    if env is None:
-        return
-    db = store.get_db(db_name)
-    if db is None:
+    if env is None or (db := store.get_db(db_name)) is None:
         return
 
     packed = pack_msgpack(dict(payload))
@@ -86,15 +76,12 @@ def put_mapping_record(
 
 
 def delete_record(
-    env: lmdb.Environment | None,
+    env: LmdbEnvironment | None,
     store: Store,
     db_name: str,
     key: bytes,
 ) -> bool:
-    if env is None:
-        return False
-    db = store.get_db(db_name)
-    if db is None:
+    if env is None or (db := store.get_db(db_name)) is None:
         return False
 
     with env.begin(write=True, db=db) as txn:

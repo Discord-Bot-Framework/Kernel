@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import typing
+from typing import Final
 
 import pygit2
 
@@ -14,7 +14,7 @@ def _discover_main_repo_path() -> str | None:
         return None
 
 
-GIT_URL_TRANS_MAP: typing.Final[dict[int, str]] = str.maketrans(
+GIT_URL_TRANS_MAP: Final[dict[int, str]] = str.maketrans(
     {"_": "_u_", "/": "_s_", ".": "_d_", "-": "_h_"},
 )
-MAIN_REPO_PATH: typing.Final[str | None] = _discover_main_repo_path()
+MAIN_REPO_PATH: Final[str | None] = _discover_main_repo_path()

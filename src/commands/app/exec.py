@@ -4,6 +4,7 @@ import io
 import textwrap
 import traceback
 import typing
+from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import redirect_stdout
 
@@ -24,7 +25,15 @@ _MAX_MESSAGE_LEN = 2000
 _CODE_BLOCK_OVERHEAD = len("```py\n\n```")
 _MAX_CODE_PAYLOAD = _MAX_MESSAGE_LEN - _CODE_BLOCK_OVERHEAD
 
-_exec_cache: dict[int, str] = {}
+_EXEC_CACHE_MAX = 128
+_exec_cache: OrderedDict[int, str] = OrderedDict()
+
+
+def _cache_exec(author_id: int, body: str) -> None:
+    _exec_cache[author_id] = body
+    _exec_cache.move_to_end(author_id)
+    if len(_exec_cache) > _EXEC_CACHE_MAX:
+        _exec_cache.popitem(last=False)
 
 
 def _strip_code_block(body: str) -> str:
@@ -99,7 +108,7 @@ class _DebugExecModal(miru.Modal):
             return
 
         raw_body = self.body.value or ""
-        _exec_cache[self._author_id] = raw_body
+        _cache_exec(self._author_id, raw_body)
         body = _strip_code_block(raw_body)
 
         env: dict[str, object] = {
@@ -140,7 +149,11 @@ class _DebugExecModal(miru.Modal):
 
         try:
             with redirect_stdout(stdout):
-                awaitable = typing.cast("typing.Awaitable[object]", func_obj())
+                func = typing.cast(
+                    "typing.Callable[[], typing.Awaitable[object]]",
+                    func_obj,
+                )
+                awaitable = func()
                 result = await awaitable
         except Exception:
             await _respond_code_chunks(

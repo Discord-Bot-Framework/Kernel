@@ -54,7 +54,7 @@ def run_pip(file_path: str, *, install: bool = True) -> bool:
 
     try:
         status_code = pip_main(command)
-        if status_code == 0:
+        if status_code == 0 or status_code is None:
             logger.info(
                 "Processed requirements file '%s' with pip %s",
                 path,

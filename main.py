@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import asyncio
 import contextlib
 import os
@@ -48,16 +49,24 @@ if typing.TYPE_CHECKING:
     from src.shared.utils.jurigged import Jurigged
 
 
-uvloop.install()
+def _install_uvloop() -> None:
+    if sys.platform == "win32":
+        return
+    with contextlib.suppress(Exception):
+        uvloop.install()
 
-if TOKEN is None or TOKEN == "":
+
+_install_uvloop()
+
+_token_value = (TOKEN or "").strip()
+if not _token_value:
     logger.info("Failed to load bot token")
     sys.exit(1)
 
 
-token: str = typing.cast("str", TOKEN)
+token: str = typing.cast("str", _token_value)
 hikari_client: hikari.GatewayBot = make_hikari_client(token)
-arc_client: arc.GatewayClient = make_arc_client(hikari_client)
+arc_client: arc.client.GatewayClient = make_arc_client(hikari_client)
 miru_client: miru.Client = miru.Client.from_arc(arc_client)
 jurigged_service: Jurigged | None = None
 
@@ -90,8 +99,10 @@ async def on_hikari_started(event: hikari.StartedEvent) -> None:
     logger.info("Processing started hikari event for %s", type(event.app).__name__)
     logger.info("Started hikari client %s", event.app)
     try:
-        me = hikari_client.get_me()
-        status = hikari.Status.ONLINE if me else hikari.Status.DO_NOT_DISTURB
+        me: hikari.OwnUser | None = hikari_client.get_me()
+        status: hikari.Status = (
+            hikari.Status.ONLINE if me else hikari.Status.DO_NOT_DISTURB
+        )
         activity = hikari.Activity(
             name="with hikari",
             type=hikari.ActivityType.LISTENING,
@@ -106,14 +117,14 @@ async def on_hikari_started(event: hikari.StartedEvent) -> None:
 
 
 @arc_client.add_startup_hook
-async def on_arc_starting(client: arc.GatewayClient) -> None:
+async def on_arc_starting(client: arc.client.GatewayClient) -> None:
     global jurigged_service
 
     discovered_modules: set[str] = set()
     try:
         with os.scandir(EXTENSIONS_DIR) as entries:
             for entry in entries:
-                entry_name = entry.name
+                entry_name: str = entry.name
                 if entry_name.startswith(".") or entry_name == "__pycache__":
                     continue
 
@@ -126,7 +137,7 @@ async def on_arc_starting(client: arc.GatewayClient) -> None:
                     continue
 
                 if entry.is_dir():
-                    entry_path = EXTENSIONS_DIR / entry_name
+                    entry_path: pathlib.Path = EXTENSIONS_DIR / entry_name
                     if (entry_path / ModuleType.PYTHON.entry_file).is_file():
                         discovered_modules.add(f"extensions.{entry_name}.main")
     except FileNotFoundError:
@@ -134,7 +145,9 @@ async def on_arc_starting(client: arc.GatewayClient) -> None:
     except OSError:
         logger.exception("Failed to discover extensions directory")
 
-    extension_modules = tuple(sorted(discovered_modules, key=str.casefold))
+    extension_modules: tuple[str, ...] = tuple(
+        sorted(discovered_modules, key=str.casefold)
+    )
     logger.info("Discovered %d modules", len(extension_modules))
 
     if extension_modules:
@@ -186,13 +199,23 @@ async def on_arc_started(event: arc.StartedEvent) -> None:
     logger.info("Started arc client %s", event.client)
 
 
-cmd_group = get_arc().include_slash_group("bot", "Bot commands")
+cmd_group: arc.command.slash.SlashGroup[arc.client.GatewayClient] = (
+    get_arc().include_slash_group("bot", "Bot commands")
+)
 hook_cmd_group(cmd_group)
 
-cmd_module = cmd_group.include_subgroup("module", "Module commands")
-cmd_kernel = cmd_group.include_subgroup("kernel", "Kernel commands")
-cmd_debug = cmd_group.include_subgroup("debug", "Debug commands")
-cmd_app = cmd_group.include_subgroup("app", "App commands")
+cmd_module: arc.command.slash.SlashSubGroup[arc.client.GatewayClient] = (
+    cmd_group.include_subgroup("module", "Module commands")
+)
+cmd_kernel: arc.command.slash.SlashSubGroup[arc.client.GatewayClient] = (
+    cmd_group.include_subgroup("kernel", "Kernel commands")
+)
+cmd_debug: arc.command.slash.SlashSubGroup[arc.client.GatewayClient] = (
+    cmd_group.include_subgroup("debug", "Debug commands")
+)
+cmd_app: arc.command.slash.SlashSubGroup[arc.client.GatewayClient] = (
+    cmd_group.include_subgroup("app", "App commands")
+)
 hook_cmd_subgroup(cmd_module)
 hook_cmd_subgroup(cmd_kernel)
 hook_cmd_subgroup(cmd_debug)
@@ -447,13 +470,15 @@ async def cmd_module_update_wrapper(
 
 
 _shutdown_started: bool = False
+_shutdown_lock = asyncio.Lock()
 
 
 async def request_shutdown(reason: str) -> None:
     global _shutdown_started
-    if _shutdown_started:
-        return
-    _shutdown_started = True
+    async with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
     logger.info("Requesting shutdown: %s", reason)
     SHUTDOWN_EVENT.set()
     with contextlib.suppress(Exception):
@@ -470,13 +495,13 @@ async def request_shutdown(reason: str) -> None:
 async def main() -> None:
     global jurigged_service
 
-    event_loop = asyncio.get_running_loop()
+    event_loop: asyncio.events.AbstractEventLoop = asyncio.get_running_loop()
 
     def exception_handler(
-        _event_loop: asyncio.AbstractEventLoop,
+        _event_loop: asyncio.events.AbstractEventLoop,
         context: dict[str, object],
     ) -> None:
-        exception = context.get("exception")
+        exception: object = context.get("exception")
         if isinstance(exception, BaseException):
             logger.exception(
                 "Handled unhandled event loop exception: %s",
@@ -484,7 +509,7 @@ async def main() -> None:
                 exc_info=exception,
             )
             return
-        message = context.get("message")
+        message: object = context.get("message")
         logger.exception("Handled unhandled event loop error: %s", message)
 
     event_loop.set_exception_handler(exception_handler)
@@ -500,14 +525,14 @@ async def main() -> None:
                 signal_type,
             )
 
-    join_task: asyncio.Task[object] | None = None
+    join_task: asyncio.Task[None] | None = None
 
     try:
         await hikari_client.start()
 
         join_task = asyncio.create_task(hikari_client.join())
         await join_task
-        join_error = join_task.exception()
+        join_error: BaseException | None = join_task.exception()
         if join_error is not None:
             logger.exception("Failed to join bot", exc_info=join_error)
         await request_shutdown("Bot connection closed")
@@ -518,7 +543,7 @@ async def main() -> None:
         logger.exception("Failed to run bot")
         await request_shutdown("Runtime failure")
     finally:
-        cleanup_tasks = tuple(
+        cleanup_tasks: tuple[asyncio.Task[None], ...] = tuple(
             task for task in (join_task,) if task is not None and not task.done()
         )
         for task in cleanup_tasks:

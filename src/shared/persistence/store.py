@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import lmdb
 import msgpack
@@ -8,6 +8,9 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     import pathlib
+
+type LmdbEnvironment = Any
+type LmdbDatabase = Any
 
 type Msgpack = (
     None
@@ -41,8 +44,8 @@ class Store:
         self.path: Final = path
         self.db_names: Final = db_names
         self.map_size: Final = map_size
-        self._env: lmdb.Environment | None = None
-        self._dbs: dict[str, lmdb._Database] = {}
+        self._env: LmdbEnvironment | None = None
+        self._dbs: dict[str, LmdbDatabase] = {}
 
     def open(self) -> None:
         if self._env is not None:
@@ -69,10 +72,10 @@ class Store:
         self._dbs.clear()
 
     @property
-    def env(self) -> lmdb.Environment | None:
+    def env(self) -> LmdbEnvironment | None:
         return self._env
 
-    def get_db(self, name: str) -> lmdb._Database | None:
+    def get_db(self, name: str) -> LmdbDatabase | None:
         return self._dbs.get(name)
 
     def __enter__(self) -> Self:

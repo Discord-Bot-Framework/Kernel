@@ -199,10 +199,9 @@ class PythonModule(Module):
             if callable_obj is None:
                 return {"error": f"Method '{method}' not found in module"}
 
-            if inspect.iscoroutinefunction(callable_obj):
-                result = await callable_obj(**payload)
-            else:
-                result = callable_obj(**payload)
+            result = callable_obj(**payload)
+            if inspect.isawaitable(result):
+                result = await result
             return {"result": result}
         except Exception as exc:
             logger.exception(

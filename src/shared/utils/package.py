@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib
 import importlib.util
 import pkgutil
@@ -7,6 +9,7 @@ from src.shared.logger import logger
 
 
 def import_package(package_name: str) -> None:
+    importlib.invalidate_caches()
     try:
         root_package = importlib.import_module(package_name)
     except Exception:

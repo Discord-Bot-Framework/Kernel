@@ -18,6 +18,8 @@ from src.shared.utils.view import defer, reply_err
 
 
 def _resolve_export_target(user_path: str) -> tuple[pathlib.Path | None, str | None]:
+    if user_path.strip().casefold() == "all":
+        return BASE_DIR, None
     try:
         candidate = BASE_DIR.joinpath(user_path).resolve()
     except Exception:

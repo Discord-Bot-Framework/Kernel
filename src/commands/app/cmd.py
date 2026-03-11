@@ -9,14 +9,10 @@ import hikari
 from src.container.app import get_arc, get_hikari
 from src.shared.logger import logger
 from src.shared.utils.view import defer, reply_embed, reply_err
+from thefuzz import process as fuzz_process
 
 if TYPE_CHECKING:
     import arc
-
-try:
-    from thefuzz import process as fuzz_process
-except ImportError:
-    fuzz_process = None
 
 
 _MAX_CHOICES = 25
@@ -120,7 +116,8 @@ def _filename_stem(name: str) -> str:
     safe = "".join(
         ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name.strip()
     )
-    return safe or "command"
+    safe = safe or "command"
+    return safe[:64]
 
 
 async def _respond_json_attachment(

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import os
+import sys
 from typing import TYPE_CHECKING
 
 from src.container.app import get_hikari
-from src.shared.constants import FLAG_DIR, Color
+from src.shared.constants import FLAG_DIR, SHUTDOWN_EVENT, Color
 from src.shared.logger import logger
 from src.shared.utils.member import dm_role_members
 from src.shared.utils.view import defer, reply_embed, reply_err, reply_ok
-from main import request_shutdown
 
 if TYPE_CHECKING:
     import arc
@@ -54,7 +55,19 @@ async def cmd_debug_restart(ctx: arc.GatewayContext) -> None:
         await reply_ok(hikari_client, ctx, "Initiated bot restart sequence.")
         _write_restart_flag(ctx.user.id)
         logger.info("Attempting graceful restart")
-        await request_shutdown("Restart requested")
+        shutdown_func = None
+        main_mod = sys.modules.get("__main__") or sys.modules.get("main")
+        if main_mod is not None:
+            shutdown_func = getattr(main_mod, "request_shutdown", None)
+        if callable(shutdown_func):
+            shutdown_result = shutdown_func("Restart requested")
+            if asyncio.iscoroutine(shutdown_result):
+                await shutdown_result
+        else:
+            SHUTDOWN_EVENT.set()
+            if hikari_client.is_alive:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(hikari_client.close(), timeout=5.0)
         await asyncio.sleep(0.1)
         logger.info("Forced restart exit")
         os._exit(0)

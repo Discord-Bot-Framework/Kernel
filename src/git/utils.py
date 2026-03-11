@@ -146,7 +146,7 @@ def clone_repo(url: str) -> tuple[str, bool]:
         return "", False
 
     repo_path = EXTENSIONS_DIR / repo_name
-    EXTENSIONS_DIR.mkdir(exist_ok=True)
+    EXTENSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         pygit2.clone_repository(url, str(repo_path))

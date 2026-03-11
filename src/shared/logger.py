@@ -47,6 +47,7 @@ def _has_target_handler(
 
 
 def _get_or_create_handler(file_path: pathlib.Path) -> RotatingFileHandler:
+    file_path = pathlib.Path(file_path).resolve()
     with _logger_lock:
         handler = _handler_cache.get(file_path)
         if handler is not None:

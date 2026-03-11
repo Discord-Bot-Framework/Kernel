@@ -46,7 +46,7 @@ def delete_module(name: str) -> bool:
 
 @functools.lru_cache(maxsize=256)
 def detect_module_type(module_path: Path) -> ModuleType | None:
-    if (module_path / "main.py").is_file():
+    if (module_path / ModuleType.PYTHON.entry_file).is_file():
         return ModuleType.PYTHON
     return None
 
